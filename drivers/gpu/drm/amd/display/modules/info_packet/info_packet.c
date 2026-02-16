@@ -664,13 +664,18 @@ static void build_vtem_infopacket_data(const struct dc_stream_state *stream,
 		struct dc_info_packet *infopacket)
 {
 	unsigned int field_rate_in_hz;
+	bool vrr_active = vrr->state == VRR_STATE_ACTIVE_VARIABLE ||
+			  vrr->state == VRR_STATE_ACTIVE_FIXED;
+
+	/* Keep the sink in VRR mode during fixed-refresh desktop operation. */
+	if (stream->freesync_on_desktop && vrr->state == VRR_STATE_INACTIVE)
+		vrr_active = true;
 
 	/* FVA Factor setting */
 	set_field_with_mask(&infopacket->sb[VTEM_MD0], MASK_VTEM_MD0__FVA_FACTOR_M1,
 			(fva_factor > 0) ? (fva_factor - 1) : 0);
 	/* VRR Parameters */
-	if (vrr->state == VRR_STATE_ACTIVE_VARIABLE ||
-	    vrr->state == VRR_STATE_ACTIVE_FIXED) {
+	if (vrr_active) {
 		set_field_with_mask(&infopacket->sb[VTEM_MD0], MASK_VTEM_MD0__VRR_EN, 1);
 	} else {
 		set_field_with_mask(&infopacket->sb[VTEM_MD0], MASK_VTEM_MD0__VRR_EN, 0);
@@ -712,8 +717,7 @@ static void build_vtem_infopacket_data(const struct dc_stream_state *stream,
 	 * VTEM with Data_Set_Length = 0 preserves the every-MTW cadence while
 	 * staying compliant (e.g. HDMI GCTS HF1-58 step 6.2).
 	 */
-	if (vrr->state != VRR_STATE_ACTIVE_VARIABLE &&
-	    vrr->state != VRR_STATE_ACTIVE_FIXED && fva_factor == 0)
+	if (!vrr_active && fva_factor == 0)
 		set_field_with_mask(&infopacket->sb[VTEM_PB6],
 				 MASK_VTEM_PB6__DATA_SET_LENGTH_LSB, 0);
 
