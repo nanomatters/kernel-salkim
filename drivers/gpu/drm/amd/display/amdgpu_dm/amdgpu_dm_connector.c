@@ -3736,7 +3736,15 @@ void amdgpu_dm_update_freesync_caps(struct drm_connector *connector,
 	struct amdgpu_hdmi_vsdb_info vsdb_info = {0};
 	const struct edid *edid;
 	bool freesync_capable = false;
+	bool hdmi_vrr_selected = false;
 	enum adaptive_sync_type as_type = ADAPTIVE_SYNC_TYPE_NONE;
+
+	amdgpu_dm_connector->min_vfreq = 0;
+	amdgpu_dm_connector->max_vfreq = 0;
+	amdgpu_dm_connector->pack_sdp_v1_3 = false;
+	amdgpu_dm_connector->as_type = ADAPTIVE_SYNC_TYPE_NONE;
+	memset(&amdgpu_dm_connector->vsdb_info, 0,
+	       sizeof(amdgpu_dm_connector->vsdb_info));
 
 	if (!connector->state) {
 		drm_err(adev_to_drm(adev), "%s - Connector has no state", __func__);
@@ -3751,10 +3759,6 @@ void amdgpu_dm_update_freesync_caps(struct drm_connector *connector,
 
 	if (!drm_edid || !sink) {
 		dm_con_state = to_dm_connector_state(connector->state);
-
-		amdgpu_dm_connector->min_vfreq = 0;
-		amdgpu_dm_connector->max_vfreq = 0;
-		freesync_capable = false;
 
 		goto update;
 	}
@@ -3775,6 +3779,9 @@ void amdgpu_dm_update_freesync_caps(struct drm_connector *connector,
 
 	/* FIXME: Get rid of drm_edid_raw() */
 	edid = drm_edid_raw(drm_edid);
+
+	if (amdgpu_dm_connector->dc_link)
+		as_type = dm_get_adaptive_sync_support_type(amdgpu_dm_connector->dc_link);
 
 	/* Some eDP panels only have the refresh rate range info in DisplayID */
 	if ((connector->display_info.monitor_range.min_vfreq == 0 ||
@@ -3801,8 +3808,9 @@ void amdgpu_dm_update_freesync_caps(struct drm_connector *connector,
 		amdgpu_dm_connector->max_vfreq = connector->display_info.monitor_range.max_vfreq;
 	}
 
-	if (sink->sink_signal == SIGNAL_TYPE_DISPLAY_PORT ||
-	    sink->sink_signal == SIGNAL_TYPE_EDP) {
+	if (as_type != FREESYNC_TYPE_PCON_IN_WHITELIST &&
+	    (sink->sink_signal == SIGNAL_TYPE_DISPLAY_PORT ||
+	     sink->sink_signal == SIGNAL_TYPE_EDP)) {
 		if (amdgpu_dm_connector->dc_link &&
 		    amdgpu_dm_connector->dc_link->dpcd_caps.allow_invalid_MSA_timing_param &&
 		    amdgpu_dm_connector->max_vfreq - amdgpu_dm_connector->min_vfreq > 10)
@@ -3837,7 +3845,9 @@ void amdgpu_dm_update_freesync_caps(struct drm_connector *connector,
 	 * If AMD VSDB didn't provide a valid FreeSync range, fall back to
 	 * the HDMI 2.1 VRR capability parsed from the HF-VSDB.
 	 */
-	if (!freesync_capable && connector->display_info.hdmi.vrr_cap.supported) {
+	if (!freesync_capable && connector->display_info.hdmi.vrr_cap.supported &&
+	    (sink->sink_signal == SIGNAL_TYPE_HDMI_TYPE_A ||
+	     sink->sink_signal == SIGNAL_TYPE_HDMI_FRL)) {
 		struct drm_hdmi_vrr_cap *vrr_cap =
 			&connector->display_info.hdmi.vrr_cap;
 
@@ -3847,6 +3857,7 @@ void amdgpu_dm_update_freesync_caps(struct drm_connector *connector,
 			       connector->display_info.monitor_range.max_vfreq);
 
 		if (vrr_cap->supported && vrr_cap->vrr_min > 0) {
+			hdmi_vrr_selected = true;
 			amdgpu_dm_connector->min_vfreq = vrr_cap->vrr_min;
 			amdgpu_dm_connector->max_vfreq = vrr_cap->vrr_max ?
 				vrr_cap->vrr_max :
@@ -3880,18 +3891,30 @@ void amdgpu_dm_update_freesync_caps(struct drm_connector *connector,
 		}
 	}
 
-	if (amdgpu_dm_connector->dc_link)
-		as_type = dm_get_adaptive_sync_support_type(amdgpu_dm_connector->dc_link);
+	if (as_type == FREESYNC_TYPE_PCON_IN_WHITELIST) {
+		const struct drm_hdmi_vrr_cap *vrr_cap = &connector->display_info.hdmi.vrr_cap;
 
-	if (has_vsdb && as_type == FREESYNC_TYPE_PCON_IN_WHITELIST) {
-		sink->edid_caps.freesync_vcp_code = vsdb_info.freesync_mccs_vcp_code;
+		/* Prefer HDMI VRR. The converter generates the HDMI metadata. */
+		if (vrr_cap->supported && vrr_cap->vrr_min && vrr_cap->vrr_max) {
+			hdmi_vrr_selected = true;
+			amdgpu_dm_connector->min_vfreq = vrr_cap->vrr_min;
+			amdgpu_dm_connector->max_vfreq = vrr_cap->vrr_max;
+			memset(&amdgpu_dm_connector->vsdb_info, 0,
+			       sizeof(amdgpu_dm_connector->vsdb_info));
+		} else if (vsdb_info.freesync_supported && vsdb_info.amd_vsdb_version > 0) {
+			sink->edid_caps.freesync_vcp_code = vsdb_info.freesync_mccs_vcp_code;
+			amdgpu_dm_connector->min_vfreq = vsdb_info.min_refresh_rate_hz;
+			amdgpu_dm_connector->max_vfreq = vsdb_info.max_refresh_rate_hz;
+		} else {
+			amdgpu_dm_connector->min_vfreq = 0;
+			amdgpu_dm_connector->max_vfreq = 0;
+		}
 
-		if (vsdb_info.freesync_supported && vsdb_info.amd_vsdb_version > 0) {
+		freesync_capable = amdgpu_dm_connector->min_vfreq > 0 &&
+			amdgpu_dm_connector->max_vfreq - amdgpu_dm_connector->min_vfreq > 10;
+		if (freesync_capable) {
 			amdgpu_dm_connector->pack_sdp_v1_3 = true;
 			amdgpu_dm_connector->as_type = as_type;
-
-			if (amdgpu_dm_connector->max_vfreq - amdgpu_dm_connector->min_vfreq > 10)
-				freesync_capable = true;
 		}
 	}
 
@@ -3910,11 +3933,11 @@ void amdgpu_dm_update_freesync_caps(struct drm_connector *connector,
 	/* HDMI/PCON without an EDID FreeSync VCP code is not FreeSync-capable. */
 	if ((sink->sink_signal == SIGNAL_TYPE_HDMI_TYPE_A ||
 	     as_type == FREESYNC_TYPE_PCON_IN_WHITELIST) &&
-	    !sink->edid_caps.freesync_vcp_code)
+	    !hdmi_vrr_selected && !sink->edid_caps.freesync_vcp_code)
 		freesync_capable = false;
 
 	/* Handle MCCS */
-	if (do_mccs) {
+	if (do_mccs && !hdmi_vrr_selected) {
 		dm_helpers_read_mccs_caps(adev->dm.dc->ctx, amdgpu_dm_connector->dc_link, sink);
 
 		if (sink->edid_caps.freesync_vcp_code && !sink->mccs_caps.freesync_supported)
