@@ -3762,15 +3762,24 @@ void amdgpu_dm_update_freesync_caps(struct drm_connector *connector,
 
 	if (edid && (sink->sink_signal == SIGNAL_TYPE_DISPLAY_PORT ||
 		     sink->sink_signal == SIGNAL_TYPE_EDP)) {
+		get_amd_vsdb(amdgpu_dm_connector, &vsdb_info);
+
 		if (amdgpu_dm_connector->dc_link &&
 		    amdgpu_dm_connector->dc_link->dpcd_caps.allow_invalid_MSA_timing_param) {
 			amdgpu_dm_connector->min_vfreq = connector->display_info.monitor_range.min_vfreq;
 			amdgpu_dm_connector->max_vfreq = connector->display_info.monitor_range.max_vfreq;
+
+			/* Some DP/eDP sinks expose their FreeSync range only in the AMD VSDB. */
+			if ((!amdgpu_dm_connector->min_vfreq || !amdgpu_dm_connector->max_vfreq) &&
+			    vsdb_info.freesync_supported && vsdb_info.min_refresh_rate_hz &&
+			    vsdb_info.max_refresh_rate_hz > vsdb_info.min_refresh_rate_hz) {
+				amdgpu_dm_connector->min_vfreq = vsdb_info.min_refresh_rate_hz;
+				amdgpu_dm_connector->max_vfreq = vsdb_info.max_refresh_rate_hz;
+			}
+
 			if (amdgpu_dm_connector->max_vfreq - amdgpu_dm_connector->min_vfreq > 10)
 				freesync_capable = true;
 		}
-
-		get_amd_vsdb(amdgpu_dm_connector, &vsdb_info);
 
 		if (vsdb_info.replay_mode) {
 			amdgpu_dm_connector->vsdb_info.replay_mode = vsdb_info.replay_mode;
