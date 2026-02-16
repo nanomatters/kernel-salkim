@@ -4882,6 +4882,11 @@ static void set_avi_info_frame(
 	unsigned int rid = pipe_ctx->stream->timing.rid;
 	unsigned int fr_ind = pipe_ctx->stream->timing.fr_index;
 	enum dc_timing_3d_format format;
+	const struct dc_info_packet *vsp = &stream->vsp_infopacket;
+	bool hf_vsif = vsp->valid &&
+		vsp->hb0 == DC_HDMI_INFOFRAME_TYPE_VENDOR && vsp->hb2 >= 5 &&
+		vsp->sb[1] == 0xd8 && vsp->sb[2] == 0x5d &&
+		vsp->sb[3] == 0xc4;
 
 	if (stream->avi_infopacket.valid) {
 		*info_packet = stream->avi_infopacket;
@@ -5037,8 +5042,8 @@ static void set_avi_info_frame(
 		vic = 0;
 	format = stream->timing.timing_3d_format;
 	/*todo, add 3DStereo support*/
-	if (format != TIMING_3D_FORMAT_NONE) {
-		// Based on HDMI specs hdmi vic needs to be converted to cea vic when 3D is enabled
+	if (format != TIMING_3D_FORMAT_NONE || hf_vsif) {
+		/* HF-VSIF replaces H14b-VSIF, so signal legacy modes through AVI. */
 		switch (pipe_ctx->stream->timing.hdmi_vic) {
 		case 1:
 			vic = 95;
