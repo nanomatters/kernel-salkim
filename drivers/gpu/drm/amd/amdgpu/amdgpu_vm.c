@@ -1090,7 +1090,7 @@ amdgpu_vm_tlb_flush(struct amdgpu_vm_update_params *params,
 
 	tlb_cb->vm = vm;
 	if (fence && !dma_fence_add_callback(fence, &tlb_cb->cb,
-					     amdgpu_vm_tlb_seq_cb)) {
+					      amdgpu_vm_tlb_seq_cb)) {
 		dma_fence_put(vm->last_seq_flush);
 		vm->last_seq_flush = dma_fence_get(fence);
 	} else {
@@ -1101,7 +1101,7 @@ amdgpu_vm_tlb_flush(struct amdgpu_vm_update_params *params,
 	/* The check for need_tlb_fence should be dropped once we
 	 * sort out the issues with KIQ/MES TLB invalidation timeouts.
 	 */
-	if (!params->unlocked && vm->need_tlb_fence) {
+	if (fence && !params->unlocked && vm->need_tlb_fence) {
 		amdgpu_vm_tlb_fence_create(params->adev, vm, fence,
 					   &vm->last_tlb_inv);
 
@@ -1256,7 +1256,7 @@ int amdgpu_vm_update_range(struct amdgpu_device *adev, struct amdgpu_vm *vm,
 		goto error_free;
 
 	if (params.needs_flush) {
-		amdgpu_vm_tlb_flush(&params, *fence, tlb_cb);
+		amdgpu_vm_tlb_flush(&params, fence ? *fence : NULL, tlb_cb);
 		tlb_cb = NULL;
 	}
 
@@ -1540,8 +1540,13 @@ static void amdgpu_vm_free_mapping(struct amdgpu_device *adev,
 				   struct amdgpu_bo_va_mapping *mapping,
 				   struct dma_fence *fence)
 {
-	if (mapping->flags & AMDGPU_VM_PAGE_PRT)
+	if (mapping->flags & AMDGPU_VM_PAGE_PRT) {
+		if (vm->need_tlb_fence) {
+			amdgpu_vm_prt_get(adev);
+			amdgpu_vm_add_prt_cb(adev, vm->last_tlb_inv);
+		}
 		amdgpu_vm_add_prt_cb(adev, fence);
+	}
 	kfree(mapping);
 }
 
@@ -2847,7 +2852,6 @@ void amdgpu_vm_fini(struct amdgpu_device *adev, struct amdgpu_vm *vm)
 	dma_fence_lock_irqsave(vm->last_seq_flush, flags);
 	dma_fence_unlock_irqrestore(vm->last_seq_flush, flags);
 	dma_fence_put(vm->last_seq_flush);
-	dma_fence_put(vm->last_tlb_inv);
 
 	list_for_each_entry_safe(mapping, tmp, &vm->freed, list) {
 		if (mapping->flags & AMDGPU_VM_PAGE_PRT && prt_fini_needed) {
@@ -2879,6 +2883,7 @@ void amdgpu_vm_fini(struct amdgpu_device *adev, struct amdgpu_vm *vm)
 	}
 
 	dma_fence_put(vm->last_update);
+	dma_fence_put(vm->last_tlb_inv);
 
 	for (i = 0; i < AMDGPU_MAX_VMHUBS; i++) {
 		amdgpu_vmid_free_reserved(adev, vm, i);
