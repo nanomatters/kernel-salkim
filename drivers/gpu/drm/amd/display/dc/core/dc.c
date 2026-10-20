@@ -2535,7 +2535,7 @@ static enum dc_status dc_commit_state_no_check(struct dc *dc, struct dc_state *c
 }
 
 static bool commit_minimal_transition_state(struct dc *dc,
-		struct dc_state *transition_base_context);
+		struct dc_state *transition_base_context, bool allow_missing_state);
 
 /**
  * dc_commit_streams - Commit current stream state
@@ -2611,7 +2611,7 @@ enum dc_status dc_commit_streams(struct dc *dc, struct dc_commit_streams_params 
 	}
 
 	if (handle_exit_odm2to1)
-		res = commit_minimal_transition_state(dc, dc->current_state);
+		res = commit_minimal_transition_state(dc, dc->current_state, false);
 
 	context = dc_state_create_current_copy(dc);
 	if (!context)
@@ -2638,9 +2638,8 @@ enum dc_status dc_commit_streams(struct dc *dc, struct dc_commit_streams_params 
 	 */
 	if (dc->hwss.is_pipe_topology_transition_seamless &&
 			!dc->hwss.is_pipe_topology_transition_seamless(dc, dc->current_state, context)) {
-		res = commit_minimal_transition_state(dc, context);
-		if (res != DC_OK) {
-			BREAK_TO_DEBUGGER();
+		if (!commit_minimal_transition_state(dc, context, true)) {
+			res = DC_ERROR_UNEXPECTED;
 			goto fail;
 		}
 	}
@@ -5678,6 +5677,7 @@ static bool commit_minimal_transition_state_in_dc_update(struct dc *dc,
  *
  * @dc: Used to get the current state status
  * @transition_base_context: New transition state
+ * @allow_missing_state: Allow a validated target if no transition was built
  *
  * In some specific configurations, such as pipe split on multi-display with
  * MPO and/or Dynamic ODM, removing a plane may cause unsupported pipe
@@ -5692,7 +5692,7 @@ static bool commit_minimal_transition_state_in_dc_update(struct dc *dc,
  * Return false if something is wrong in the transition state.
  */
 static bool commit_minimal_transition_state(struct dc *dc,
-		struct dc_state *transition_base_context)
+		struct dc_state *transition_base_context, bool allow_missing_state)
 {
 	struct dc_state *transition_context;
 	struct pipe_split_policy_backup policy;
@@ -5755,6 +5755,13 @@ static bool commit_minimal_transition_state(struct dc *dc,
 	dc_state_retain(transition_base_context);
 	transition_context = create_minimal_transition_state(dc,
 			transition_base_context, &policy);
+	if (!transition_context && allow_missing_state) {
+		/* The target was already validated and no hardware was programmed. */
+		dc_state_release(transition_base_context);
+		DC_LOG_WARNING("%s: minimal transition unavailable; committing target\n",
+			       __func__);
+		return true;
+	}
 	if (transition_context) {
 		ret = dc_commit_state_no_check(dc, transition_context);
 		release_minimal_transition_state(dc, transition_context, transition_base_context, &policy);
@@ -6016,7 +6023,7 @@ static bool update_planes_and_stream_v2(struct dc *dc,
 
 	/* on plane addition, minimal state is the current one */
 	if (force_minimal_pipe_splitting && is_plane_addition &&
-		!commit_minimal_transition_state(dc, dc->current_state))
+		!commit_minimal_transition_state(dc, dc->current_state, false))
 		return false;
 
 	if (!update_planes_and_stream_state(
@@ -6031,7 +6038,7 @@ static bool update_planes_and_stream_v2(struct dc *dc,
 
 	/* on plane removal, minimal state is the new one */
 	if (force_minimal_pipe_splitting && !is_plane_addition) {
-		if (!commit_minimal_transition_state(dc, context)) {
+		if (!commit_minimal_transition_state(dc, context, false)) {
 			dc_state_release(context);
 			return false;
 		}
