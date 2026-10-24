@@ -748,6 +748,9 @@ static int amdgpu_dm_init(struct amdgpu_device *adev)
 		dc_init_callbacks(adev->dm.dc, &init_params);
 	}
 	if (adev->dm.dc->caps.max_links > 0) {
+		adev->dm.hdmi_frl_status_polling_delay_ms = 200;
+		INIT_DELAYED_WORK(&adev->dm.hdmi_frl_status_polling_work,
+				  hdmi_frl_status_polling_work);
 		adev->dm.hdmi_frl_status_polling_wq =
 			create_singlethread_workqueue("hdmi_frl_status_polling_wq");
 		if (!adev->dm.hdmi_frl_status_polling_wq)
@@ -855,6 +858,13 @@ static void amdgpu_dm_fini(struct amdgpu_device *adev)
 	if (adev->dm.vblank_control_workqueue) {
 		destroy_workqueue(adev->dm.vblank_control_workqueue);
 		adev->dm.vblank_control_workqueue = NULL;
+	}
+
+	/* The poll re-queues itself, so stop it before the wq and dc go away. */
+	if (adev->dm.hdmi_frl_status_polling_wq) {
+		cancel_delayed_work_sync(&adev->dm.hdmi_frl_status_polling_work);
+		destroy_workqueue(adev->dm.hdmi_frl_status_polling_wq);
+		adev->dm.hdmi_frl_status_polling_wq = NULL;
 	}
 
 	if (adev->dm.idle_workqueue) {
@@ -4639,25 +4649,24 @@ static void amdgpu_dm_commit_streams(struct drm_atomic_commit *state,
 		dc_allow_idle_optimizations(dm->dc, true);
 	mutex_unlock(&dm->dc_lock);
 
-	bool frl_stream_found = false;
+	if (dm->hdmi_frl_status_polling_wq) {
+		bool frl_stream_found = false;
 
-	for (i = 0; i < params.stream_count; i++) {
-		struct dc_stream_state *stream = params.streams[i];
-
-		if (stream->signal == SIGNAL_TYPE_HDMI_FRL) {
-			frl_stream_found = true;
-			break;
+		for (i = 0; i < params.stream_count; i++) {
+			if (params.streams[i]->signal == SIGNAL_TYPE_HDMI_FRL) {
+				frl_stream_found = true;
+				break;
+			}
 		}
-	}
 
-	if (frl_stream_found) {
-		if (queue_delayed_work(dm->hdmi_frl_status_polling_wq,
-				       &dm->hdmi_frl_status_polling_work,
-				       msecs_to_jiffies(dm->hdmi_frl_status_polling_delay_ms)))
-			drm_dbg_kms(dev, "200ms frl status polling starts ...\n");
-	} else {
-		if (cancel_delayed_work_sync(&dm->hdmi_frl_status_polling_work))
+		if (frl_stream_found) {
+			if (queue_delayed_work(dm->hdmi_frl_status_polling_wq,
+					       &dm->hdmi_frl_status_polling_work,
+					       msecs_to_jiffies(dm->hdmi_frl_status_polling_delay_ms)))
+				drm_dbg_kms(dev, "200ms frl status polling starts ...\n");
+		} else if (cancel_delayed_work_sync(&dm->hdmi_frl_status_polling_work)) {
 			drm_dbg_kms(dev, "200ms frl status polling stops ...\n");
+		}
 	}
 
 	for_each_new_crtc_in_state(state, crtc, new_crtc_state, i) {
