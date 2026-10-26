@@ -368,7 +368,7 @@ struct dm_connector_state {
 };
 struct dc_stream_state {
     struct { unsigned pix_clk_100hz, h_total, v_total; } timing;
-    bool ignore_msa_timing_param, freesync_on_desktop;
+    bool ignore_msa_timing_param, freesync_on_desktop, allow_freesync;
 };
 struct mod_freesync_config {
     int state;
@@ -402,6 +402,7 @@ int main(void)
         crtc.freesync_config.state = VRR_STATE_INACTIVE;
         amdgpu_dm_get_freesync_config_for_crtc(&crtc, &con);
         assert(crtc.vrr_supported == (rate >= 58));
+        assert(stream.allow_freesync == crtc.vrr_supported);
         if (crtc.vrr_supported) {
             assert(crtc.freesync_config.state == VRR_STATE_ACTIVE_VARIABLE);
             assert(crtc.freesync_config.max_refresh_in_uhz == (u64)rate * 1000000);
@@ -413,14 +414,17 @@ int main(void)
     amdgpu_dm_get_freesync_config_for_crtc(&crtc, &con);
     assert(crtc.vrr_supported);
     assert(crtc.freesync_config.max_refresh_in_uhz == 239760000);
+    assert(stream.allow_freesync);
     c.vrr_max_from_mode = false;
     c.max_vfreq = 120;
     amdgpu_dm_get_freesync_config_for_crtc(&crtc, &con);
     assert(!crtc.vrr_supported);
+    assert(!stream.allow_freesync);
     crtc.base.mode.rate = 120;
     stream.timing.pix_clk_100hz = 1200000;
     amdgpu_dm_get_freesync_config_for_crtc(&crtc, &con);
     assert(crtc.vrr_supported && crtc.freesync_config.max_refresh_in_uhz == 120000000);
+    assert(stream.allow_freesync);
     return 0;
 }
 '''
