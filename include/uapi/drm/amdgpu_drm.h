@@ -60,6 +60,7 @@ extern "C" {
 #define DRM_AMDGPU_GEM_LIST_HANDLES	0x19
 #define DRM_AMDGPU_PROC_OPTIONS		0x1A
 #define DRM_AMDGPU_UALINK_HANDLE	0x1B
+#define DRM_AMDGPU_GEM_VA_BATCH		0x1C
 
 #define DRM_IOCTL_AMDGPU_GEM_CREATE	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDGPU_GEM_CREATE, union drm_amdgpu_gem_create)
 #define DRM_IOCTL_AMDGPU_GEM_MMAP	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDGPU_GEM_MMAP, union drm_amdgpu_gem_mmap)
@@ -83,6 +84,54 @@ extern "C" {
 #define DRM_IOCTL_AMDGPU_GEM_LIST_HANDLES DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDGPU_GEM_LIST_HANDLES, struct drm_amdgpu_gem_list_handles)
 #define DRM_IOCTL_AMDGPU_PROC_OPTIONS	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDGPU_PROC_OPTIONS, struct drm_amdgpu_proc_options)
 #define DRM_IOCTL_AMDGPU_UALINK_HANDLE DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDGPU_UALINK_HANDLE, union drm_amdgpu_ualink_handle)
+#define DRM_IOCTL_AMDGPU_GEM_VA_BATCH \
+	DRM_IOW(DRM_COMMAND_BASE + DRM_AMDGPU_GEM_VA_BATCH, struct drm_amdgpu_gem_va_batch)
+
+/* Local, versioned ABI: probe INFO first. Never infer support from DRM minor. */
+#define AMDGPU_INFO_GEM_VA_BATCH		0x25
+#define AMDGPU_GEM_VA_BATCH_COOKIE	0x53414c4b56414203ULL
+#define AMDGPU_GEM_VA_BATCH_MAX_OPS	4096
+
+struct drm_amdgpu_info_gem_va_batch {
+	__u64 cookie;
+	__u32 max_ops;
+	__u32 reserved;
+};
+
+/* REPLACE operations, in array order. PRT with handle 0 unbinds a range.
+ * DELAY_UPDATE is not accepted: the batch applies all its pending mappings.
+ */
+struct drm_amdgpu_gem_va_batch_op {
+	__u32 handle;
+	__u32 flags;
+	__u64 va_address;
+	__u64 offset_in_bo;
+	__u64 map_size;
+};
+
+/* Batched GEM_VA acceptance. Probe INFO and match the cookie before use.
+ * Reserved fields and flags must be zero.
+ *
+ * A negative ioctl return leaves every mapping unchanged. A zero return accepts
+ * the entire array, in order. The request is input-only, so no copy-out can fail
+ * after acceptance. There is no partial count, secondary status or safe replay
+ * of a successful request.
+ *
+ * Acceptance does not mean GPU completion. As with GEM_VA, page-table updates
+ * may remain pending when the VM is evicted or an update fails. The kernel keeps
+ * that work for command-submission validation, which must complete preparation
+ * successfully before submitting commands. Existing update-fence dependencies
+ * and TLB-invalidation rules remain in effect. Persistent update failures are
+ * reported by command submission, not by replaying the accepted batch.
+ * No userspace semaphore is signaled by this ioctl.
+ */
+struct drm_amdgpu_gem_va_batch {
+	__u64 cookie;
+	__u64 operations;
+	__u32 count;
+	__u32 flags;
+	__u64 reserved[2];
+};
 
 /**
  * DOC: memory domains
