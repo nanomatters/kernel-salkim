@@ -92,10 +92,18 @@ extern "C" {
 #define AMDGPU_GEM_VA_BATCH_COOKIE	0x53414c4b56414203ULL
 #define AMDGPU_GEM_VA_BATCH_MAX_OPS	4096
 
+/* The caller has completed the dependencies of the replaced ranges.
+ * Eligible retirements may omit implicit rendering waits. CS update waits,
+ * movement dependencies and invalidation rules are unchanged.
+ */
+#define AMDGPU_GEM_VA_BATCH_WAIT_COMPLETE	(1U << 0)
+
 struct drm_amdgpu_info_gem_va_batch {
 	__u64 cookie;
 	__u32 max_ops;
 	__u32 reserved;
+	/* Optional extension: zero the query buffer before probing older kernels. */
+	__u64 features;
 };
 
 /* REPLACE operations, in array order. PRT with handle 0 unbinds a range.
@@ -110,7 +118,7 @@ struct drm_amdgpu_gem_va_batch_op {
 };
 
 /* Batched GEM_VA acceptance. Probe INFO and match the cookie before use.
- * Reserved fields and flags must be zero.
+ * Reserved fields must be zero. Optional flags must be advertised in features.
  *
  * A negative ioctl return leaves every mapping unchanged. A zero return accepts
  * the entire array, in order. The request is input-only, so no copy-out can fail

@@ -48,6 +48,7 @@
 #include "amdgpu_hmm.h"
 #include "amdgpu_xgmi.h"
 #include "amdgpu_vm.h"
+#include "amdgpu_userq.h"
 
 static int
 amdgpu_gem_add_input_fence(struct drm_file *filp,
@@ -1082,11 +1083,13 @@ int amdgpu_gem_va_batch_ioctl(struct drm_device *dev, void *data,
 	struct drm_exec exec;
 	DEFINE_XARRAY(bos);
 	LIST_HEAD(freed);
+	bool explicit_sync = args->flags & AMDGPU_GEM_VA_BATCH_WAIT_COMPLETE;
 	u64 end, vm_size = adev->vm_manager.max_pfn * AMDGPU_GPU_PAGE_SIZE;
 	u32 i, j;
 	int r;
 
-	if (args->cookie != AMDGPU_GEM_VA_BATCH_COOKIE || args->flags ||
+	if (args->cookie != AMDGPU_GEM_VA_BATCH_COOKIE ||
+	    (args->flags & ~AMDGPU_GEM_VA_BATCH_WAIT_COMPLETE) ||
 	    args->reserved[0] || args->reserved[1] ||
 	    !args->count || args->count > AMDGPU_GEM_VA_BATCH_MAX_OPS)
 		return -EINVAL;
@@ -1158,6 +1161,12 @@ int amdgpu_gem_va_batch_ioctl(struct drm_device *dev, void *data,
 		if (r)
 			goto unlock;
 	}
+	/* KFD can change the VM mode after the capability probe. */
+	if (explicit_sync && (vm->use_cpu_for_update || vm->is_compute_context ||
+			      vm->need_tlb_fence || amdgpu_userq_enabled(dev))) {
+		r = -EOPNOTSUPP;
+		goto unlock;
+	}
 	for (i = 0; i < args->count; ++i) {
 		bo_va = entries[i].obj ?
 			amdgpu_vm_bo_find(vm, gem_to_amdgpu_bo(entries[i].obj)) :
@@ -1176,9 +1185,10 @@ int amdgpu_gem_va_batch_ioctl(struct drm_device *dev, void *data,
 	for (i = 0; i < args->count; ++i)
 		amdgpu_vm_bo_replace_map_prealloc(adev, entries[i].bo_va,
 			ops[i].va_address, ops[i].offset_in_bo, ops[i].map_size,
-			ops[i].flags, entries[i].maps, &freed);
-	/* Retire batch and legacy unmaps with the same dependencies. */
-	list_splice_init(&freed, &vm->freed);
+			ops[i].flags, entries[i].maps, &freed,
+			explicit_sync ? &explicit_sync : NULL);
+	if (!explicit_sync)
+		list_splice_init(&freed, &vm->freed);
 
 	/* Like GEM_VA, leave updates pending until CS validates the VM. */
 	if (!amdgpu_vm_ready(vm)) {
@@ -1188,6 +1198,9 @@ int amdgpu_gem_va_batch_ioctl(struct drm_device *dev, void *data,
 
 	/* Reuse existing batching, reservation dependencies and invalidation. */
 	r = amdgpu_vm_clear_freed(adev, vm, &vm->last_update);
+	if (!r && explicit_sync)
+		r = amdgpu_vm_clear_freed_list(adev, vm, &freed,
+					       AMDGPU_SYNC_EXPLICIT, &vm->last_update);
 	if (!r)
 		r = amdgpu_vm_bo_update_batch(adev, vm, &bos);
 	if (!r)
@@ -1198,6 +1211,8 @@ int amdgpu_gem_va_batch_ioctl(struct drm_device *dev, void *data,
 				    "Deferred batch page-table update after error %d\n", r);
 	r = 0;
 unlock:
+	/* Deferred or failed retirements resume on the conservative path. */
+	list_splice_init(&freed, &vm->freed);
 	drm_exec_fini(&exec);
 out:
 	xa_destroy(&bos);
