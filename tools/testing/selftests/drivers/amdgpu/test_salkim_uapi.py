@@ -171,6 +171,22 @@ static size_t copy_to_user(void *dst, const void *src, size_t len)
     memcpy(dst, src, len);
     return 0;
 }
+static int copy_struct_from_user(void *dst, size_t size, const void *src, size_t usize)
+{
+    ++copies_in;
+    if (fail_in) return -EFAULT;
+    assert(usize >= size && usize <= AMDGPU_SALKIM_MAX_PAYLOAD);
+    for (size_t i = size; i < usize; ++i)
+        if (((const unsigned char *)src)[i]) return -E2BIG;
+    memcpy(dst, src, size);
+    return 0;
+}
+static bool amdgpu_gem_va_batch_supported(struct amdgpu_device *adev, struct amdgpu_vm *vm) { return true; }
+static int amdgpu_gem_va_batch_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
+{
+    ++batch_calls;
+    return backend_result;
+}
 
 static int drm_ioctl_kernel(struct file *file,
                             int (*callback)(struct drm_device *, void *, struct drm_file *),
@@ -203,8 +219,9 @@ int main(void)
         uint64_t alignment;
         unsigned char bytes[4096];
         struct drm_amdgpu_salkim_caps caps;
+        struct drm_amdgpu_gem_va_batch batch;
     } payload = {0};
-    const unsigned sizes[] = {0, sizeof(payload.caps), 0, 0, 0};
+    const unsigned sizes[] = {0, sizeof(payload.caps), sizeof(payload.batch), 0, 0};
     struct drm_amdgpu_salkim_request req = {.magic = AMDGPU_SALKIM_MAGIC,
         .abi = AMDGPU_SALKIM_ABI, .op = AMDGPU_SALKIM_OP_CAPS,
         .payload = (uintptr_t)&payload, .payload_size = sizeof(payload.caps)};
@@ -249,7 +266,6 @@ int main(void)
     assert(!amdgpu_salkim_dispatch(&file, (uintptr_t)&req));
     assert(payload.caps.magic == AMDGPU_SALKIM_MAGIC && payload.caps.abi == AMDGPU_SALKIM_ABI);
     assert(payload.caps.size == sizeof(payload.caps));
-    assert(!payload.caps.features && !payload.caps.batch_features && !payload.caps.max_ops);
     assert(!payload.caps.relative_priority_ip_mask);
     for (unsigned i = 0; i < 3; ++i) assert(!payload.caps.reserved[i]);
     no_backend(); assert(copies_in == 1 && copies_out == 1);
