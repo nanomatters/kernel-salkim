@@ -144,6 +144,8 @@ void amdgpu_dm_get_freesync_config_for_crtc(
 	struct amdgpu_dm_connector *aconnector;
 	struct drm_display_mode *mode = &new_crtc_state->base.mode;
 	int vrefresh = drm_mode_vrefresh(mode);
+	int max_vfreq;
+	u64 nominal_refresh_in_uhz = 0;
 	bool fs_vid_mode = false;
 	bool vrr_timing_valid;
 
@@ -151,23 +153,29 @@ void amdgpu_dm_get_freesync_config_for_crtc(
 		return;
 
 	aconnector = to_amdgpu_dm_connector(new_con_state->base.connector);
+	if (aconnector->vrr_max_from_mode &&
+	    new_crtc_state->stream->timing.h_total && new_crtc_state->stream->timing.v_total)
+		nominal_refresh_in_uhz = mod_freesync_calc_nominal_field_rate(new_crtc_state->stream);
+
+	max_vfreq = aconnector->vrr_max_from_mode ?
+		(int)DIV_ROUND_UP_ULL(nominal_refresh_in_uhz, 1000000) : aconnector->max_vfreq;
 
 	vrr_timing_valid = amdgpu_dm_is_vrr_timing_valid(new_crtc_state->stream,
 							 aconnector->min_vfreq,
-							 aconnector->max_vfreq);
+							 max_vfreq);
 	if (!vrr_timing_valid)
 		drm_dbg_kms(new_con_state->base.connector->dev,
 			    "VRR invalid %s %s %dx%d@%d %d-%d clk=%u h=%u v=%u\n",
 			    new_con_state->base.connector->name, mode->name,
 			    mode->hdisplay, mode->vdisplay, vrefresh,
-			    aconnector->min_vfreq, aconnector->max_vfreq,
+			    aconnector->min_vfreq, max_vfreq,
 			    new_crtc_state->stream->timing.pix_clk_100hz,
 			    new_crtc_state->stream->timing.h_total,
 			    new_crtc_state->stream->timing.v_total);
 
 	new_crtc_state->vrr_supported = new_con_state->freesync_capable &&
 					vrefresh >= aconnector->min_vfreq &&
-					vrefresh <= aconnector->max_vfreq &&
+					vrefresh <= max_vfreq &&
 					vrr_timing_valid;
 
 	if (new_crtc_state->vrr_supported) {
@@ -175,7 +183,8 @@ void amdgpu_dm_get_freesync_config_for_crtc(
 		fs_vid_mode = new_crtc_state->freesync_config.state == VRR_STATE_ACTIVE_FIXED;
 
 		config.min_refresh_in_uhz = aconnector->min_vfreq * 1000000;
-		config.max_refresh_in_uhz = aconnector->max_vfreq * 1000000;
+		config.max_refresh_in_uhz = aconnector->vrr_max_from_mode ?
+			nominal_refresh_in_uhz : aconnector->max_vfreq * 1000000ULL;
 		config.vsif_supported = true;
 		config.btr = true;
 
@@ -206,7 +215,7 @@ out:
 		       new_crtc_state->base.vrr_enabled,
 		       new_crtc_state->vrr_supported,
 		       new_con_state->freesync_capable, vrefresh,
-		       aconnector->min_vfreq, aconnector->max_vfreq,
+		       aconnector->min_vfreq, max_vfreq,
 		       config.state);
 }
 EXPORT_IF_KUNIT(amdgpu_dm_get_freesync_config_for_crtc);
