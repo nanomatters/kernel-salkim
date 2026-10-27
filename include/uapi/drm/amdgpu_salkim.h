@@ -37,7 +37,9 @@ struct drm_amdgpu_salkim_request {
 #define AMDGPU_SALKIM_IOCTL _IOW('S', 0x4b, struct drm_amdgpu_salkim_request)
 
 #define AMDGPU_SALKIM_OP_CAPS 1
+#define AMDGPU_SALKIM_OP_VA_BATCH 2
 
+#define AMDGPU_SALKIM_CAP_BATCH_LEGACY (1ULL << 0)
 
 /* Snapshot for this DRM file. Operations revalidate mutable VM eligibility. */
 struct drm_amdgpu_salkim_caps {
@@ -53,5 +55,42 @@ struct drm_amdgpu_salkim_caps {
 };
 
 
+#define AMDGPU_GEM_VA_BATCH_MAX_OPS	4096
+
+/* REPLACE operations, in array order. PRT with handle 0 unbinds a range.
+ * DELAY_UPDATE is not accepted; the kernel manages pending updates.
+ */
+struct drm_amdgpu_gem_va_batch_op {
+	__u32 handle;
+	__u32 flags;
+	__u64 va_address;
+	__u64 offset_in_bo;
+	__u64 map_size;
+};
+
+/* Batched GEM_VA acceptance for kernel-queue VMs, not async VM_BIND.
+ * Probe SALKIM capabilities before use. Optional flags must be advertised
+ * in batch_features. Reserved fields must be zero. KFD, user-queue and CPU-updated VMs
+ * must use the legacy GEM_VA path.
+ *
+ * A negative ioctl return leaves every mapping unchanged. A zero return accepts
+ * the entire array, in order. The request is input-only, so no copy-out can fail
+ * after acceptance. There is no partial count, secondary status or safe replay
+ * of a successful request.
+ *
+ * Acceptance does not mean GPU completion. As with GEM_VA, page-table updates
+ * may remain pending when the VM is evicted or an update fails. The kernel keeps
+ * that work for command-submission validation, which must complete preparation
+ * successfully before submitting commands. Existing update-fence dependencies
+ * and TLB-invalidation rules remain in effect. Persistent update failures are
+ * reported by command submission, not by replaying the accepted batch.
+ * No userspace semaphore is signaled by this ioctl.
+ */
+struct drm_amdgpu_gem_va_batch {
+	__u64 operations;
+	__u32 count;
+	__u32 flags;
+	__u64 reserved[2];
+};
 
 #endif

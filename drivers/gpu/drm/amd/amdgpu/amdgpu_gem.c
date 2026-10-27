@@ -35,6 +35,7 @@
 #include <linux/uaccess.h>
 
 #include <drm/amdgpu_drm.h>
+#include <drm/amdgpu_salkim.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_exec.h>
 #include <drm/drm_gem_ttm_helper.h>
@@ -47,6 +48,7 @@
 #include "amdgpu_hmm.h"
 #include "amdgpu_xgmi.h"
 #include "amdgpu_vm.h"
+#include "amdgpu_userq.h"
 
 static int
 amdgpu_gem_add_input_fence(struct drm_file *filp,
@@ -1037,6 +1039,174 @@ error:
 	drm_exec_fini(&exec);
 error_put_gobj:
 	drm_gem_object_put(gobj);
+	return r;
+}
+
+/* Deferred updates rely on the kernel command-submission validation path. */
+bool amdgpu_gem_va_batch_supported(struct amdgpu_device *adev,
+				   struct amdgpu_vm *vm)
+{
+	return !adev->debug_vm && !vm->use_cpu_for_update &&
+		!vm->is_compute_context && !vm->need_tlb_fence &&
+		!amdgpu_userq_enabled(adev_to_drm(adev));
+}
+
+struct amdgpu_va_batch_entry {
+	struct drm_gem_object *obj;
+	struct amdgpu_bo_va *bo_va;
+	struct amdgpu_bo_va_mapping *maps[3];
+};
+
+int amdgpu_gem_va_batch_ioctl(struct drm_device *dev, void *data,
+			    struct drm_file *filp)
+{
+	const u32 flags = AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_WRITEABLE |
+		AMDGPU_VM_PAGE_EXECUTABLE | AMDGPU_VM_MTYPE_MASK | AMDGPU_VM_PAGE_NOALLOC;
+	struct drm_amdgpu_gem_va_batch *args = data;
+	struct amdgpu_device *adev = drm_to_adev(dev);
+	struct amdgpu_fpriv *fpriv = filp->driver_priv;
+	struct amdgpu_vm *vm = &fpriv->vm;
+	struct drm_amdgpu_gem_va_batch_op *ops;
+	struct amdgpu_va_batch_entry *entries;
+	struct amdgpu_bo_va *bo_va;
+	struct drm_exec exec;
+	DEFINE_XARRAY(bos);
+	u64 end, vm_size = adev->vm_manager.max_pfn * AMDGPU_GPU_PAGE_SIZE;
+	unsigned long index;
+	u32 i, j;
+	int r;
+
+	if (args->flags ||
+	    args->reserved[0] || args->reserved[1] ||
+	    !args->count || args->count > AMDGPU_GEM_VA_BATCH_MAX_OPS)
+		return -EINVAL;
+	if (!amdgpu_gem_va_batch_supported(adev, vm))
+		return -EOPNOTSUPP;
+	ops = vmemdup_user(u64_to_user_ptr(args->operations),
+			  array_size(args->count, sizeof(*ops)));
+	if (IS_ERR(ops))
+		return PTR_ERR(ops);
+	entries = kvcalloc(args->count, sizeof(*entries), GFP_KERNEL);
+	if (!entries) {
+		kvfree(ops);
+		return -ENOMEM;
+	}
+
+	/* No mapping mutation or GPU submission during preparation. */
+	for (i = 0; i < args->count; ++i) {
+		struct drm_amdgpu_gem_va_batch_op *op = &ops[i];
+		struct amdgpu_bo *bo = NULL;
+
+		r = -EINVAL;
+		if ((op->flags & ~flags) && op->flags != AMDGPU_VM_PAGE_PRT)
+			goto out;
+		if (op->flags & AMDGPU_VM_PAGE_PRT) {
+			if (op->handle || op->offset_in_bo)
+				goto out;
+		} else {
+			entries[i].obj = drm_gem_object_lookup(filp, op->handle);
+			if (!entries[i].obj) {
+				r = -ENOENT;
+				goto out;
+			}
+			bo = gem_to_amdgpu_bo(entries[i].obj);
+		}
+		if (op->va_address < AMDGPU_VA_RESERVED_BOTTOM ||
+		    (op->va_address >= AMDGPU_GMC_HOLE_START &&
+		     op->va_address < AMDGPU_GMC_HOLE_END))
+			goto out;
+		op->va_address &= AMDGPU_GMC_HOLE_MASK;
+		if (check_add_overflow(op->va_address, op->map_size, &end) ||
+		    end > vm_size - AMDGPU_VA_RESERVED_TOP)
+			goto out;
+		r = amdgpu_vm_verify_parameters(adev, bo, op->va_address,
+					       op->offset_in_bo, op->map_size);
+		if (r)
+			goto out;
+		for (j = 0; j < ARRAY_SIZE(entries[i].maps); ++j) {
+			entries[i].maps[j] = kzalloc_obj(*entries[i].maps[j]);
+			if (!entries[i].maps[j]) {
+				r = -ENOMEM;
+				goto out;
+			}
+		}
+	}
+
+	drm_exec_init(&exec, DRM_EXEC_INTERRUPTIBLE_WAIT |
+		      DRM_EXEC_IGNORE_DUPLICATES, 0);
+	drm_exec_until_all_locked(&exec) {
+		for (i = 0; i < args->count; ++i) {
+			if (!entries[i].obj)
+				continue;
+			r = drm_exec_lock_obj(&exec, entries[i].obj);
+			drm_exec_retry_on_contention(&exec);
+			if (r)
+				goto unlock;
+		}
+		r = amdgpu_vm_lock_pd(vm, &exec, 2);
+		drm_exec_retry_on_contention(&exec);
+		if (r)
+			goto unlock;
+	}
+	/* KFD can change the VM mode after the capability probe. */
+	if (!amdgpu_gem_va_batch_supported(adev, vm)) {
+		r = -EOPNOTSUPP;
+		goto unlock;
+	}
+	for (i = 0; i < args->count; ++i) {
+		bo_va = entries[i].obj ?
+			amdgpu_vm_bo_find(vm, gem_to_amdgpu_bo(entries[i].obj)) :
+			fpriv->prt_va;
+		if (!bo_va) {
+			r = -ENOENT;
+			goto unlock;
+		}
+		entries[i].bo_va = bo_va;
+		r = xa_err(xa_store(&bos, ops[i].handle, bo_va, GFP_KERNEL));
+		if (r)
+			goto unlock;
+	}
+
+	/* This phase consumes the prepared records and cannot fail. */
+	for (i = 0; i < args->count; ++i)
+		amdgpu_vm_bo_replace_map_prealloc(adev, entries[i].bo_va,
+			ops[i].va_address, ops[i].offset_in_bo, ops[i].map_size,
+			ops[i].flags, entries[i].maps);
+
+	/* Like GEM_VA, leave updates pending until CS validates the VM. */
+	if (!amdgpu_vm_ready(vm)) {
+		r = 0;
+		goto unlock;
+	}
+
+	/* Reuse existing batching, reservation dependencies and invalidation. */
+	r = amdgpu_vm_clear_freed(adev, vm, &vm->last_update);
+	if (!r) {
+		xa_for_each(&bos, index, bo_va) {
+			r = amdgpu_vm_bo_update(adev, bo_va, false);
+			if (r)
+				break;
+		}
+	}
+	if (!r)
+		r = amdgpu_vm_update_pdes(adev, vm, false);
+	/* Acceptance is final. CS retries unfinished clears, mappings and PDEs. */
+	if (r)
+		dev_dbg_ratelimited(adev->dev,
+				    "Deferred batch page-table update after error %d\n", r);
+	r = 0;
+unlock:
+	drm_exec_fini(&exec);
+out:
+	xa_destroy(&bos);
+	for (i = 0; i < args->count; ++i) {
+		for (j = 0; j < ARRAY_SIZE(entries[i].maps); ++j)
+			kfree(entries[i].maps[j]);
+		if (entries[i].obj)
+			drm_gem_object_put(entries[i].obj);
+	}
+	kvfree(entries);
+	kvfree(ops);
 	return r;
 }
 
