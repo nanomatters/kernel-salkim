@@ -1081,6 +1081,7 @@ int amdgpu_gem_va_batch_ioctl(struct drm_device *dev, void *data,
 	struct amdgpu_bo_va *bo_va;
 	struct drm_exec exec;
 	DEFINE_XARRAY(bos);
+	LIST_HEAD(freed);
 	u64 end, vm_size = adev->vm_manager.max_pfn * AMDGPU_GPU_PAGE_SIZE;
 	u32 i, j;
 	int r;
@@ -1175,7 +1176,9 @@ int amdgpu_gem_va_batch_ioctl(struct drm_device *dev, void *data,
 	for (i = 0; i < args->count; ++i)
 		amdgpu_vm_bo_replace_map_prealloc(adev, entries[i].bo_va,
 			ops[i].va_address, ops[i].offset_in_bo, ops[i].map_size,
-			ops[i].flags, entries[i].maps);
+			ops[i].flags, entries[i].maps, &freed);
+	/* Retire batch and legacy unmaps with the same dependencies. */
+	list_splice_init(&freed, &vm->freed);
 
 	/* Like GEM_VA, leave updates pending until CS validates the VM. */
 	if (!amdgpu_vm_ready(vm)) {
