@@ -63,6 +63,7 @@ static void amdgpu_salkim_get_caps(struct drm_device *dev, struct drm_file *filp
 		caps->features |= AMDGPU_SALKIM_CAP_BATCH_LEGACY;
 	if (caps->features & AMDGPU_SALKIM_CAP_BATCH_LEGACY) {
 		caps->max_ops = AMDGPU_GEM_VA_BATCH_MAX_OPS;
+		caps->batch_features = AMDGPU_GEM_VA_BATCH_WAIT_COMPLETE;
 	}
 }
 
