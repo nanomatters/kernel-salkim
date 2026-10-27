@@ -1341,6 +1341,159 @@ void amdgpu_vm_get_memory(struct amdgpu_vm *vm,
 	spin_unlock(&vm->stats_lock);
 }
 
+static void amdgpu_vm_bo_update_done(struct amdgpu_bo_va *bo_va, bool clear);
+
+static int amdgpu_vm_bo_update_internal(struct amdgpu_device *adev,
+				       struct amdgpu_bo_va *bo_va, bool clear,
+				       struct amdgpu_vm_update_batch *shared)
+{
+	struct amdgpu_vm_update_batch local_batch, *batch = shared ?: &local_batch;
+	struct amdgpu_bo *bo = bo_va->base.bo;
+	struct amdgpu_vm *vm = bo_va->base.vm;
+	struct amdgpu_bo_va_mapping *mapping;
+	struct dma_fence **last_update;
+	dma_addr_t *pages_addr = NULL;
+	struct ttm_resource *mem;
+	struct amdgpu_sync sync;
+	bool flush_tlb = clear;
+	uint64_t vram_base;
+	uint64_t flags;
+	bool uncached, batching;
+	int r = 0, ret;
+
+	amdgpu_sync_create(&sync);
+	if (clear) {
+		mem = NULL;
+
+		/* Implicitly sync to command submissions in the same VM before
+		 * unmapping.
+		 */
+		r = amdgpu_sync_resv(adev, &sync, vm->root.bo->tbo.base.resv,
+				     AMDGPU_SYNC_EQ_OWNER, vm);
+		if (r)
+			goto error_free;
+		if (bo) {
+			r = amdgpu_sync_kfd(&sync, bo->tbo.base.resv);
+			if (r)
+				goto error_free;
+		}
+	} else if (!bo) {
+		mem = NULL;
+
+		/* PRT map operations don't need to sync to anything. */
+
+	} else {
+		struct drm_gem_object *obj = &bo->tbo.base;
+
+		if (drm_gem_is_imported(obj) && bo_va->is_xgmi) {
+			struct dma_buf *dma_buf = obj->import_attach->dmabuf;
+			struct drm_gem_object *gobj = dma_buf->priv;
+			struct amdgpu_bo *abo = gem_to_amdgpu_bo(gobj);
+
+			if (abo->tbo.resource &&
+			    abo->tbo.resource->mem_type == TTM_PL_VRAM)
+				bo = gem_to_amdgpu_bo(gobj);
+		}
+		mem = bo->tbo.resource;
+		if (mem && (mem->mem_type == TTM_PL_TT ||
+			    mem->mem_type == AMDGPU_PL_PREEMPT))
+			pages_addr = bo->tbo.ttm->dma_address;
+
+		/* Implicitly sync to moving fences before mapping anything */
+		if (!shared) {
+			r = amdgpu_sync_resv(adev, &sync, bo->tbo.base.resv,
+					     AMDGPU_SYNC_EXPLICIT, vm);
+			if (r)
+				goto error_free;
+		}
+	}
+
+	if (bo) {
+		struct amdgpu_device *bo_adev;
+
+		flags = amdgpu_ttm_tt_pte_flags(adev, bo->tbo.ttm, mem);
+
+		if (amdgpu_bo_encrypted(bo))
+			flags |= AMDGPU_PTE_TMZ;
+
+		bo_adev = amdgpu_ttm_adev(bo->tbo.bdev);
+		vram_base = bo_adev->vm_manager.vram_base_offset;
+		uncached = (bo->flags & AMDGPU_GEM_CREATE_UNCACHED) != 0;
+	} else {
+		flags = 0x0;
+		vram_base = 0;
+		uncached = false;
+	}
+
+	if (clear || amdgpu_vm_is_bo_always_valid(vm, bo))
+		last_update = &vm->last_update;
+	else
+		last_update = &bo_va->last_pt_update;
+
+	if (!clear && bo_va->base.moved) {
+		flush_tlb = true;
+		list_splice_init(&bo_va->valids, &bo_va->invalids);
+
+	} else if (bo_va->cleared != clear) {
+		list_splice_init(&bo_va->valids, &bo_va->invalids);
+	}
+
+	batching = shared || (!vm->use_cpu_for_update && !list_empty(&bo_va->invalids));
+	if (shared) {
+		batch->params.needs_flush |= flush_tlb;
+		batch->params.override_pte = !uncached && adev->gmc.override_pte;
+	} else if (batching) {
+		r = amdgpu_vm_update_begin(batch, adev, vm, false, false,
+					   flush_tlb, !uncached, &sync);
+		if (r)
+			goto error_free;
+	}
+
+	list_for_each_entry(mapping, &bo_va->invalids, list) {
+		uint64_t update_flags = flags;
+
+		/* normally,bo_va->flags only contians READABLE and WIRTEABLE bit go here
+		 * but in case of something, we filter the flags in first place
+		 */
+		if (!(mapping->flags & AMDGPU_VM_PAGE_READABLE))
+			update_flags &= ~AMDGPU_PTE_READABLE;
+		if (!(mapping->flags & AMDGPU_VM_PAGE_WRITEABLE))
+			update_flags &= ~AMDGPU_PTE_WRITEABLE;
+
+		/* Apply ASIC specific mapping flags */
+		amdgpu_gmc_get_vm_pte(adev, vm, bo, mapping->flags,
+				      &update_flags);
+
+		trace_amdgpu_vm_bo_update(mapping);
+
+		if (batching)
+			r = amdgpu_vm_update_pages(&batch->params, mapping->start,
+					   mapping->last, update_flags,
+					   mapping->offset, vram_base, mem,
+					   pages_addr);
+		else
+			r = amdgpu_vm_update_range(adev, vm, false, false, flush_tlb,
+					   !uncached, &sync, mapping->start,
+					   mapping->last, update_flags,
+					   mapping->offset, vram_base, mem,
+					   pages_addr, last_update);
+		if (r)
+			break;
+	}
+
+	if (batching && !shared) {
+		ret = amdgpu_vm_update_end(batch, last_update);
+		if (!r)
+			r = ret;
+	}
+	if (!r && !shared)
+		amdgpu_vm_bo_update_done(bo_va, clear);
+
+error_free:
+	amdgpu_sync_free(&sync);
+	return r;
+}
+
 static void amdgpu_vm_bo_update_done(struct amdgpu_bo_va *bo_va, bool clear)
 {
 	struct amdgpu_bo *bo = bo_va->base.bo;
@@ -1393,19 +1546,8 @@ static void amdgpu_vm_bo_update_done(struct amdgpu_bo_va *bo_va, bool clear)
 int amdgpu_vm_bo_update(struct amdgpu_device *adev, struct amdgpu_bo_va *bo_va,
 			bool clear)
 {
-	struct amdgpu_vm_update_batch batch;
-	struct amdgpu_bo *bo = bo_va->base.bo;
 	struct amdgpu_vm *vm = bo_va->base.vm;
-	struct amdgpu_bo_va_mapping *mapping;
-	struct dma_fence **last_update;
-	dma_addr_t *pages_addr = NULL;
-	struct ttm_resource *mem;
-	struct amdgpu_sync sync;
-	bool flush_tlb = clear;
-	uint64_t vram_base;
-	uint64_t flags;
-	bool uncached, batching;
-	int r = 0, ret;
+	int r;
 
 	/* A retried clear must not erase a replacement mapping. */
 	if (!clear && !list_empty(&vm->freed)) {
@@ -1414,134 +1556,68 @@ int amdgpu_vm_bo_update(struct amdgpu_device *adev, struct amdgpu_bo_va *bo_va,
 			return r;
 	}
 
+	return amdgpu_vm_bo_update_internal(adev, bo_va, clear, NULL);
+}
+
+static bool amdgpu_vm_bo_can_batch(struct amdgpu_vm *vm,
+				   struct amdgpu_bo_va *bo_va)
+{
+	struct amdgpu_bo *bo = bo_va->base.bo;
+
+	return !vm->use_cpu_for_update && amdgpu_vm_is_bo_always_valid(vm, bo) &&
+		!drm_gem_is_imported(&bo->tbo.base) &&
+		(bo_va->base.moved || bo_va->cleared || !list_empty(&bo_va->invalids));
+}
+
+/* Share a submission only for native BOs with the root reservation. */
+int amdgpu_vm_bo_update_batch(struct amdgpu_device *adev, struct amdgpu_vm *vm,
+			      struct xarray *bos)
+{
+	struct amdgpu_vm_update_batch batch;
+	struct amdgpu_bo_va *bo_va;
+	struct amdgpu_sync sync;
+	unsigned long index;
+	bool pending = false;
+	int r, ret;
+
+	xa_for_each(bos, index, bo_va) {
+		if (amdgpu_vm_bo_can_batch(vm, bo_va)) {
+			pending = true;
+			continue;
+		}
+		r = amdgpu_vm_bo_update(adev, bo_va, false);
+		if (r)
+			return r;
+	}
+	if (!pending)
+		return 0;
+
 	amdgpu_sync_create(&sync);
-	if (clear) {
-		mem = NULL;
-
-		/* Implicitly sync to command submissions in the same VM before
-		 * unmapping.
-		 */
-		r = amdgpu_sync_resv(adev, &sync, vm->root.bo->tbo.base.resv,
-				     AMDGPU_SYNC_EQ_OWNER, vm);
-		if (r)
-			goto error_free;
-		if (bo) {
-			r = amdgpu_sync_kfd(&sync, bo->tbo.base.resv);
-			if (r)
-				goto error_free;
-		}
-	} else if (!bo) {
-		mem = NULL;
-
-		/* PRT map operations don't need to sync to anything. */
-
-	} else {
-		struct drm_gem_object *obj = &bo->tbo.base;
-
-		if (drm_gem_is_imported(obj) && bo_va->is_xgmi) {
-			struct dma_buf *dma_buf = obj->import_attach->dmabuf;
-			struct drm_gem_object *gobj = dma_buf->priv;
-			struct amdgpu_bo *abo = gem_to_amdgpu_bo(gobj);
-
-			if (abo->tbo.resource &&
-			    abo->tbo.resource->mem_type == TTM_PL_VRAM)
-				bo = gem_to_amdgpu_bo(gobj);
-		}
-		mem = bo->tbo.resource;
-		if (mem && (mem->mem_type == TTM_PL_TT ||
-			    mem->mem_type == AMDGPU_PL_PREEMPT))
-			pages_addr = bo->tbo.ttm->dma_address;
-
-		/* Implicitly sync to moving fences before mapping anything */
-		r = amdgpu_sync_resv(adev, &sync, bo->tbo.base.resv,
-				     AMDGPU_SYNC_EXPLICIT, vm);
-		if (r)
-			goto error_free;
-	}
-
-	if (bo) {
-		struct amdgpu_device *bo_adev;
-
-		flags = amdgpu_ttm_tt_pte_flags(adev, bo->tbo.ttm, mem);
-
-		if (amdgpu_bo_encrypted(bo))
-			flags |= AMDGPU_PTE_TMZ;
-
-		bo_adev = amdgpu_ttm_adev(bo->tbo.bdev);
-		vram_base = bo_adev->vm_manager.vram_base_offset;
-		uncached = (bo->flags & AMDGPU_GEM_CREATE_UNCACHED) != 0;
-	} else {
-		flags = 0x0;
-		vram_base = 0;
-		uncached = false;
-	}
-
-	if (clear || amdgpu_vm_is_bo_always_valid(vm, bo))
-		last_update = &vm->last_update;
-	else
-		last_update = &bo_va->last_pt_update;
-
-	if (!clear && bo_va->base.moved) {
-		flush_tlb = true;
-		list_splice_init(&bo_va->valids, &bo_va->invalids);
-
-	} else if (bo_va->cleared != clear) {
-		list_splice_init(&bo_va->valids, &bo_va->invalids);
-	}
-
-	batching = !vm->use_cpu_for_update && !list_empty(&bo_va->invalids);
-	if (batching) {
+	r = amdgpu_sync_resv(adev, &sync, vm->root.bo->tbo.base.resv,
+			     AMDGPU_SYNC_EXPLICIT, vm);
+	if (!r)
 		r = amdgpu_vm_update_begin(&batch, adev, vm, false, false,
-					   flush_tlb, !uncached, &sync);
-		if (r)
-			goto error_free;
-	}
+					   false, false, &sync);
+	amdgpu_sync_free(&sync);
+	if (r)
+		return r;
 
-	list_for_each_entry(mapping, &bo_va->invalids, list) {
-		uint64_t update_flags = flags;
-
-		/* normally,bo_va->flags only contians READABLE and WIRTEABLE bit go here
-		 * but in case of something, we filter the flags in first place
-		 */
-		if (!(mapping->flags & AMDGPU_VM_PAGE_READABLE))
-			update_flags &= ~AMDGPU_PTE_READABLE;
-		if (!(mapping->flags & AMDGPU_VM_PAGE_WRITEABLE))
-			update_flags &= ~AMDGPU_PTE_WRITEABLE;
-
-		/* Apply ASIC specific mapping flags */
-		amdgpu_gmc_get_vm_pte(adev, vm, bo, mapping->flags,
-				      &update_flags);
-
-		trace_amdgpu_vm_bo_update(mapping);
-
-		if (batching)
-			r = amdgpu_vm_update_pages(&batch.params, mapping->start,
-					   mapping->last, update_flags,
-					   mapping->offset, vram_base, mem,
-					   pages_addr);
-		else
-			r = amdgpu_vm_update_range(adev, vm, false, false, flush_tlb,
-					   !uncached, &sync, mapping->start,
-					   mapping->last, update_flags,
-					   mapping->offset, vram_base, mem,
-					   pages_addr, last_update);
+	xa_for_each(bos, index, bo_va) {
+		if (!amdgpu_vm_bo_can_batch(vm, bo_va))
+			continue;
+		r = amdgpu_vm_bo_update_internal(adev, bo_va, false, &batch);
 		if (r)
 			break;
 	}
+	ret = amdgpu_vm_update_end(&batch, &vm->last_update);
+	if (r || ret)
+		return r ?: ret;
 
-	if (batching) {
-		ret = amdgpu_vm_update_end(&batch, last_update);
-		if (!r)
-			r = ret;
-	}
-	if (r)
-		goto error_free;
-
-	amdgpu_vm_bo_update_done(bo_va, clear);
-
-error_free:
-	amdgpu_sync_free(&sync);
-	return r;
+	/* Keep every mapping retryable until the shared commit succeeds. */
+	xa_for_each(bos, index, bo_va)
+		if (amdgpu_vm_bo_can_batch(vm, bo_va))
+			amdgpu_vm_bo_update_done(bo_va, false);
+	return 0;
 }
 
 /**
