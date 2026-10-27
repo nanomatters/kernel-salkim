@@ -57,6 +57,12 @@ struct drm_amdgpu_salkim_caps {
 
 #define AMDGPU_GEM_VA_BATCH_MAX_OPS	4096
 
+/* The caller has completed the dependencies of the replaced ranges.
+ * Eligible retirements may omit implicit rendering waits. CS update waits,
+ * movement dependencies and invalidation rules are unchanged.
+ */
+#define AMDGPU_GEM_VA_BATCH_WAIT_COMPLETE	(1U << 0)
+
 /* REPLACE operations, in array order. PRT with handle 0 unbinds a range.
  * DELAY_UPDATE is not accepted; the kernel manages pending updates.
  */
