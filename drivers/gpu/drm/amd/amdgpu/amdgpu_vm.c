@@ -1341,6 +1341,43 @@ void amdgpu_vm_get_memory(struct amdgpu_vm *vm,
 	spin_unlock(&vm->stats_lock);
 }
 
+static void amdgpu_vm_bo_update_done(struct amdgpu_bo_va *bo_va, bool clear)
+{
+	struct amdgpu_bo *bo = bo_va->base.bo;
+	struct amdgpu_vm *vm = bo_va->base.vm;
+	struct amdgpu_bo_va_mapping *mapping;
+
+	/* If the BO is not in its preferred location add it back to
+	 * the evicted list so that it gets validated again on the
+	 * next command submission.
+	 */
+	if (amdgpu_vm_is_bo_always_valid(vm, bo)) {
+		if (bo->tbo.resource &&
+		    !(bo->preferred_domains &
+		      amdgpu_mem_type_to_domain(bo->tbo.resource->mem_type)))
+			amdgpu_vm_bo_evicted(&bo_va->base);
+		else
+			amdgpu_vm_bo_idle(&bo_va->base);
+	} else if (bo) {
+		/*
+		 * A PRT/sparse mapping has no BO and is kept off the vm_bo
+		 * state lists (see amdgpu_vm_bo_base_init()); putting it on the
+		 * idle list here would let amdgpu_vm_handle_moved() dereference
+		 * the NULL bo after a reset.
+		 */
+		amdgpu_vm_bo_idle(&bo_va->base);
+	}
+
+	list_splice_init(&bo_va->invalids, &bo_va->valids);
+	bo_va->cleared = clear;
+	bo_va->base.moved = false;
+
+	if (trace_amdgpu_vm_bo_mapping_enabled()) {
+		list_for_each_entry(mapping, &bo_va->valids, list)
+			trace_amdgpu_vm_bo_mapping(mapping);
+	}
+}
+
 /**
  * amdgpu_vm_bo_update - update all BO mappings in the vm page table
  *
@@ -1500,35 +1537,7 @@ int amdgpu_vm_bo_update(struct amdgpu_device *adev, struct amdgpu_bo_va *bo_va,
 	if (r)
 		goto error_free;
 
-	/* If the BO is not in its preferred location add it back to
-	 * the evicted list so that it gets validated again on the
-	 * next command submission.
-	 */
-	if (amdgpu_vm_is_bo_always_valid(vm, bo)) {
-		if (bo->tbo.resource &&
-		    !(bo->preferred_domains &
-		      amdgpu_mem_type_to_domain(bo->tbo.resource->mem_type)))
-			amdgpu_vm_bo_evicted(&bo_va->base);
-		else
-			amdgpu_vm_bo_idle(&bo_va->base);
-	} else if (bo) {
-		/*
-		 * A PRT/sparse mapping has no BO and is kept off the vm_bo
-		 * state lists (see amdgpu_vm_bo_base_init()); putting it on the
-		 * idle list here would let amdgpu_vm_handle_moved() dereference
-		 * the NULL bo after a reset.
-		 */
-		amdgpu_vm_bo_idle(&bo_va->base);
-	}
-
-	list_splice_init(&bo_va->invalids, &bo_va->valids);
-	bo_va->cleared = clear;
-	bo_va->base.moved = false;
-
-	if (trace_amdgpu_vm_bo_mapping_enabled()) {
-		list_for_each_entry(mapping, &bo_va->valids, list)
-			trace_amdgpu_vm_bo_mapping(mapping);
-	}
+	amdgpu_vm_bo_update_done(bo_va, clear);
 
 error_free:
 	amdgpu_sync_free(&sync);
