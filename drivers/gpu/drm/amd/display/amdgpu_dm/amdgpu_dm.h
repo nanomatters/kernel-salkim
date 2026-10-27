@@ -859,9 +859,15 @@ struct amdgpu_dm_connector {
 
 	/**
 	 * @max_vfreq: Maximum frequency supported by the display in Hz. This
-	 * value is set to zero when there is no FreeSync support.
+	 * value is zero without FreeSync support or when @vrr_max_from_mode is set.
 	 */
-	int max_vfreq ;
+	int max_vfreq;
+
+	/**
+	 * @vrr_max_from_mode: HDMI VRRmax is zero, so the active timing sets the
+	 * upper limit instead of a sink-wide maximum.
+	 */
+	bool vrr_max_from_mode;
 
 	/* Audio instance - protected by audio_lock. */
 	int audio_inst;
