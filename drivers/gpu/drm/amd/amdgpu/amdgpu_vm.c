@@ -1959,7 +1959,7 @@ static void amdgpu_vm_bo_insert_map(struct amdgpu_device *adev,
 }
 
 /* Validate operation parameters to prevent potential abuse */
-static int amdgpu_vm_verify_parameters(struct amdgpu_device *adev,
+int amdgpu_vm_verify_parameters(struct amdgpu_device *adev,
 					  struct amdgpu_bo *bo,
 					  uint64_t saddr,
 					  uint64_t offset,
@@ -2288,6 +2288,23 @@ int amdgpu_vm_bo_clear_mappings(struct amdgpu_device *adev,
 	}
 	amdgpu_vm_bo_clear_mappings_prealloc(adev, vm, saddr, size, before, after);
 	return 0;
+}
+
+/* Parameters are validated and all three records allocated before mutation. */
+void amdgpu_vm_bo_replace_map_prealloc(struct amdgpu_device *adev,
+		struct amdgpu_bo_va *bo_va, uint64_t saddr, uint64_t offset,
+		uint64_t size, uint32_t flags, struct amdgpu_bo_va_mapping **maps)
+{
+	struct amdgpu_bo_va_mapping *mapping = maps[0];
+
+	amdgpu_vm_bo_clear_mappings_prealloc(adev, bo_va->base.vm, saddr, size,
+					   maps[1], maps[2]);
+	mapping->start = saddr / AMDGPU_GPU_PAGE_SIZE;
+	mapping->last = mapping->start + (size - 1) / AMDGPU_GPU_PAGE_SIZE;
+	mapping->offset = offset;
+	mapping->flags = flags;
+	amdgpu_vm_bo_insert_map(adev, bo_va, mapping);
+	maps[0] = maps[1] = maps[2] = NULL;
 }
 
 /**

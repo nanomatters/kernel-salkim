@@ -17,6 +17,9 @@ static_assert(offsetof(struct drm_amdgpu_salkim_request, reserved) == 28);
 static_assert(sizeof(struct drm_amdgpu_salkim_caps) == 64);
 static_assert(offsetof(struct drm_amdgpu_salkim_caps, features) == 16);
 static_assert(offsetof(struct drm_amdgpu_salkim_caps, relative_priority_ip_mask) == 36);
+static_assert(sizeof(struct drm_amdgpu_gem_va_batch) == 32);
+static_assert(offsetof(struct drm_amdgpu_gem_va_batch, reserved) == 16);
+static_assert(sizeof(struct drm_amdgpu_gem_va_batch_op) == 32);
 
 static int amdgpu_salkim_validate_request(const struct drm_amdgpu_salkim_request *request)
 {
@@ -30,6 +33,9 @@ static int amdgpu_salkim_validate_request(const struct drm_amdgpu_salkim_request
 	switch (request->op) {
 	case AMDGPU_SALKIM_OP_CAPS:
 		minimum = sizeof(struct drm_amdgpu_salkim_caps);
+		break;
+	case AMDGPU_SALKIM_OP_VA_BATCH:
+		minimum = sizeof(struct drm_amdgpu_gem_va_batch);
 		break;
 	default:
 		return -ENOTTY;
@@ -45,13 +51,19 @@ static int amdgpu_salkim_validate_request(const struct drm_amdgpu_salkim_request
 static void amdgpu_salkim_get_caps(struct drm_device *dev, struct drm_file *filp,
 				   struct drm_amdgpu_salkim_caps *caps)
 {
+	struct amdgpu_device *adev = drm_to_adev(dev);
+	struct amdgpu_fpriv *fpriv = filp->driver_priv;
 
 	*caps = (struct drm_amdgpu_salkim_caps) {
 		.magic = AMDGPU_SALKIM_MAGIC,
 		.abi = AMDGPU_SALKIM_ABI,
 		.size = sizeof(*caps),
 	};
-
+	if (amdgpu_gem_va_batch_supported(adev, &fpriv->vm))
+		caps->features |= AMDGPU_SALKIM_CAP_BATCH_LEGACY;
+	if (caps->features & AMDGPU_SALKIM_CAP_BATCH_LEGACY) {
+		caps->max_ops = AMDGPU_GEM_VA_BATCH_MAX_OPS;
+	}
 }
 
 static int amdgpu_salkim_ioctl(struct drm_device *dev, void *data,
@@ -71,6 +83,14 @@ static int amdgpu_salkim_ioctl(struct drm_device *dev, void *data,
 
 		amdgpu_salkim_get_caps(dev, filp, &caps);
 		return copy_to_user(payload, &caps, sizeof(caps)) ? -EFAULT : 0;
+	}
+	case AMDGPU_SALKIM_OP_VA_BATCH: {
+		struct drm_amdgpu_gem_va_batch args;
+
+		r = copy_struct_from_user(&args, sizeof(args), payload, request->payload_size);
+		if (r)
+			return r;
+		return amdgpu_gem_va_batch_ioctl(dev, &args, filp);
 	}
 	default:
 		return -ENOTTY;
