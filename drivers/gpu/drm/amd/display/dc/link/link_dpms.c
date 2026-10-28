@@ -2691,10 +2691,6 @@ static enum dc_status link_set_dpms_on_enable_link(
 	if (!link->link_status.link_active)
 		disable_link(link, &pipe_ctx->link_res, stream->signal);
 
-	/*
-	 * Link enable failed; do NOT set skip_remaining so that post_enable_link
-	 * still runs and leaves hardware in a consistent state.
-	 */
 	return DC_DPMS_FAILED_HANDSHAKE;
 }
 
@@ -2804,11 +2800,11 @@ enum dc_status link_set_dpms_on(
 
 		switch (step_result) {
 		case DC_DPMS_SUCCESS:
-		case DC_DPMS_FAILED_HANDSHAKE:
 			// Enum is ordered from "best" to "worst" results
 			result = max(result, step_result);
 			break;
 
+		case DC_DPMS_FAILED_HANDSHAKE:
 		case DC_DPMS_SKIPPED_HANDSHAKE:
 			return step_result;
 
