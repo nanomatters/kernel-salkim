@@ -988,8 +988,12 @@ amdgpu_userq_bo_validate(struct amdgpu_device *adev, struct drm_exec *exec,
 
 retry:
 	spin_lock(&vm->individual_lock);
-	while (!list_empty(&vm->individual.needs_update)) {
-		bo_va = list_first_entry(&vm->individual.needs_update,
+	while (!list_empty(&vm->individual.evicted) ||
+	       !list_empty(&vm->individual.needs_update)) {
+		struct list_head *pending = !list_empty(&vm->individual.evicted) ?
+			&vm->individual.evicted : &vm->individual.needs_update;
+
+		bo_va = list_first_entry(pending,
 					 struct amdgpu_bo_va,
 					 base.vm_status);
 		bo = bo_va->base.bo;
