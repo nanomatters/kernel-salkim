@@ -1141,7 +1141,8 @@ retry_lock:
 		invalidated = false;
 	}
 
-	ret = amdgpu_vm_handle_moved(adev, vm, NULL);
+	/* Preserve mappings of BOs already locked by this restore operation. */
+	ret = amdgpu_vm_handle_moved(adev, vm, drm_exec_ticket(&exec));
 	if (ret)
 		goto unlock_all;
 
