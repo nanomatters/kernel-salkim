@@ -1434,6 +1434,7 @@ static void amdgpu_cs_parser_fini(struct amdgpu_cs_parser *parser)
 int amdgpu_cs_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
 {
 	struct amdgpu_device *adev = drm_to_adev(dev);
+	struct amdgpu_fpriv *fpriv = filp->driver_priv;
 	struct amdgpu_bo_list_entry *e;
 	struct amdgpu_cs_parser parser;
 	int r;
@@ -1443,6 +1444,10 @@ int amdgpu_cs_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
 
 	if (!adev->accel_working)
 		return -EBUSY;
+
+	r = amdgpu_vm_batch_status(&fpriv->vm);
+	if (r)
+		return r;
 
 	PM_RUNTIME_ACQUIRE_IF_ENABLED_AUTOSUSPEND(dev->dev, lock);
 
@@ -1486,6 +1491,10 @@ int amdgpu_cs_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
 		goto error_free_user_pages;
 
 	trace_amdgpu_cs_ibs(&parser);
+
+	r = amdgpu_vm_batch_status(&fpriv->vm);
+	if (r)
+		goto error_free_user_pages;
 
 	r = amdgpu_cs_submit(&parser, data);
 	if (r)
