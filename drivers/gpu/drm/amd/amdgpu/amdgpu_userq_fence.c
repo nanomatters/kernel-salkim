@@ -806,6 +806,7 @@ amdgpu_userq_wait_return_fence_info(struct drm_device *dev, struct drm_file *fil
 			r = amdgpu_userq_wait_add_fence(wait_info, fences,
 							&num_fences, f);
 			if (r) {
+				dma_fence_put(iter.chain);
 				dma_fence_put(fence);
 				goto free_fences;
 			}

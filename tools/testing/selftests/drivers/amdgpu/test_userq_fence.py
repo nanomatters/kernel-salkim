@@ -68,6 +68,8 @@ struct dma_fence {
     u64 seqno;
     unsigned refs, waited;
     int error;
+    struct dma_fence *children[3];
+    unsigned child_count;
 };
 #define TASK_COMM_LEN 16
 ACTUAL_STRUCTURES
@@ -78,7 +80,7 @@ struct drm_file { u64 client_id; struct amdgpu_fpriv *driver_priv; };
 struct drm_device { void *dev; };
 struct dma_resv { struct dma_fence *fences[8]; unsigned count; };
 struct dma_resv_iter { unsigned index; struct dma_resv *resv; };
-struct dma_fence_unwrap { struct dma_fence *next; };
+struct dma_fence_unwrap { struct dma_fence *chain; unsigned index; };
 struct drm_gem_object { struct dma_resv *resv; };
 struct drm_exec { int unused; };
 struct xarray { struct amdgpu_userq_fence_driver *entries[8]; unsigned count; };
@@ -107,7 +109,7 @@ static u64 seq64_word;
     for ((it)->resv = (r), (it)->index = 0; \
          (it)->index < (it)->resv->count && ((f) = (it)->resv->fences[(it)->index]); (it)->index++)
 #define dma_fence_unwrap_for_each(f, it, root) \
-    for ((it)->next = (root); ((f) = (it)->next); (it)->next = NULL)
+    for ((f) = unwrap_first((root), (it)); (f); (f) = unwrap_next(it))
 #define trace_amdgpu_userq_wait_deps(dev, q, f) ((void)0)
 #define xa_limit_32b 0
 #define u64_to_user_ptr(p) ((void *)(uintptr_t)(p))
@@ -121,6 +123,21 @@ static struct dma_fence *dma_fence_get(struct dma_fence *f) { assert(f->refs); f
 static void dma_fence_put(struct dma_fence *f) { assert(f->refs > 1); f->refs--; }
 static int dma_fence_wait(struct dma_fence *f, bool interruptible)
 { assert(interruptible); f->waited++; return f->error; }
+static struct dma_fence *unwrap_first(struct dma_fence *f, struct dma_fence_unwrap *it)
+{
+    it->chain = dma_fence_get(f);
+    it->index = 0;
+    return f->child_count ? f->children[0] : f;
+}
+static struct dma_fence *unwrap_next(struct dma_fence_unwrap *it)
+{
+    struct dma_fence *f = it->chain;
+    if (++it->index < f->child_count)
+        return f->children[it->index];
+    dma_fence_put(f);
+    it->chain = NULL;
+    return NULL;
+}
 static int drm_syncobj_find_fence(struct drm_file *file, u32 handle, u64 point,
                                  u64 flags, struct dma_fence **f)
 {
