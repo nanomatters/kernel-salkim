@@ -181,7 +181,8 @@ static int copy_struct_from_user(void *dst, size_t size, const void *src, size_t
     memcpy(dst, src, size);
     return 0;
 }
-static bool amdgpu_gem_va_batch_supported(struct amdgpu_device *adev, struct amdgpu_vm *vm) { return true; }
+static bool amdgpu_gem_va_batch_supported(struct amdgpu_device *adev, struct amdgpu_vm *vm,
+                                         bool timeline) { return true; }
 static int amdgpu_gem_va_batch_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
 {
     ++batch_calls;
