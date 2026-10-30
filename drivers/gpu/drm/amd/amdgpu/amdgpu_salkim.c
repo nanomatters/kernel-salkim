@@ -59,11 +59,15 @@ static void amdgpu_salkim_get_caps(struct drm_device *dev, struct drm_file *filp
 		.abi = AMDGPU_SALKIM_ABI,
 		.size = sizeof(*caps),
 	};
-	if (amdgpu_gem_va_batch_supported(adev, &fpriv->vm))
+	if (amdgpu_gem_va_batch_supported(adev, &fpriv->vm, false))
 		caps->features |= AMDGPU_SALKIM_CAP_BATCH_LEGACY;
-	if (caps->features & AMDGPU_SALKIM_CAP_BATCH_LEGACY) {
+	if (amdgpu_gem_va_batch_supported(adev, &fpriv->vm, true))
+		caps->features |= AMDGPU_SALKIM_CAP_BATCH_TIMELINE;
+	if (caps->features & (AMDGPU_SALKIM_CAP_BATCH_LEGACY |
+			      AMDGPU_SALKIM_CAP_BATCH_TIMELINE)) {
 		caps->max_ops = AMDGPU_GEM_VA_BATCH_MAX_OPS;
-		caps->batch_features = AMDGPU_GEM_VA_BATCH_WAIT_COMPLETE;
+		caps->batch_features = AMDGPU_GEM_VA_BATCH_WAIT_COMPLETE |
+			AMDGPU_GEM_VA_BATCH_VM_TIMELINE;
 	}
 }
 
