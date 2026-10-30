@@ -733,6 +733,28 @@ static void query_tests(void)
     }
 }
 
+static void conditional_flush_tests(void)
+{
+    setup(true); struct drm_amdgpu_gem_va_batch a = request(true); flush_trigger = 0;
+    assert(!run(&a) && published == 1 && !dependency_stage);
+    assert(first_syncobj.fence->kind == 1 && priv.vm.last_tlb_inv == &leaves[5]);
+    assert(!dma_fence_is_signaled(first_syncobj.fence));
+    for (unsigned i = 0; i < ARRAY_SIZE(leaves); i++) leaves[i].signaled = true;
+    assert(dma_fence_is_signaled(first_syncobj.fence));
+    cleanup();
+    /* A queued flush changes the fence before its deferred sequence callback runs. */
+    setup(true); a = request(true); flush_trigger = 2;
+    assert(!run(&a) && published == 1 && dependency_stage == 3 && !priv.vm.tlb_seq);
+    assert(first_syncobj.fence->kind == 2);
+    struct dma_fence_array *array = (void *)first_syncobj.fence->dependency;
+    bool found = false;
+    for (unsigned i = 0; i < array->num_fences; i++) found |= array->fences[i] == &leaves[7];
+    assert(found); cleanup();
+    /* A synchronous PDE sequence update also requests the final flush. */
+    setup(true); a = request(true); priv.vm.tlb_seq = UINT64_MAX;
+    assert(!run(&a) && dependency_stage == 3 && !priv.vm.tlb_seq); cleanup();
+}
+
 static void sticky_ioctl_tests(void)
 {
     setup(true); struct drm_amdgpu_gem_va_batch a = request(true);
@@ -752,7 +774,7 @@ static void sticky_ioctl_tests(void)
     failure_stage = 0; before = allocation_count;
     assert(run(&a) == -EIO && mutations == 3 && !published && allocation_count == before); cleanup();
 
-    setup(false); a = request(true); flush_trigger = 0;
+    setup(true); a = request(true); flush_trigger = 0;
     assert(!run(&a) && first_syncobj.fence->kind == 1);
     leaves[1].error = -EIO; leaves[1].signaled = true;
     assert(!dma_fence_is_signaled(first_syncobj.fence));
@@ -805,6 +827,7 @@ int main(void)
     boundary_tests();
     capability_and_limit_tests();
     query_tests();
+    conditional_flush_tests();
     sticky_ioctl_tests();
     concurrency_test();
     printf("VA batch: %u cases passed\n", cases);
