@@ -1158,6 +1158,7 @@ int amdgpu_gem_va_batch_ioctl(struct drm_device *dev, void *data,
 	struct dma_fence_chain *timeline_chain = NULL;
 	struct dma_fence_array *array = NULL;
 	struct dma_fence **fences = NULL;
+	struct dma_fence *previous_tlb = NULL;
 	struct amdgpu_vm_batch_entry *batch_entry = NULL;
 	struct drm_exec exec;
 	DEFINE_XARRAY(bos);
@@ -1165,6 +1166,7 @@ int amdgpu_gem_va_batch_ioctl(struct drm_device *dev, void *data,
 	bool explicit_sync = args->flags & AMDGPU_GEM_VA_BATCH_WAIT_COMPLETE;
 	bool timeline = args->flags & AMDGPU_GEM_VA_BATCH_VM_TIMELINE;
 	bool accepted = false;
+	u64 tlb_seq = 0;
 	unsigned int num_bos = 0;
 	unsigned long index;
 	u64 end, vm_size = adev->vm_manager.max_pfn * AMDGPU_GPU_PAGE_SIZE;
@@ -1334,6 +1336,8 @@ int amdgpu_gem_va_batch_ioctl(struct drm_device *dev, void *data,
 		r = amdgpu_vm_batch_prepare(vm);
 		if (r)
 			goto unlock;
+		previous_tlb = dma_fence_get(vm->last_tlb_inv);
+		tlb_seq = atomic64_read(&vm->tlb_seq);
 	}
 
 	/* This phase consumes the prepared records and cannot fail. */
@@ -1372,7 +1376,9 @@ int amdgpu_gem_va_batch_ioctl(struct drm_device *dev, void *data,
 		fence = amdgpu_gem_va_batch_fence(vm, &bos, array, fences);
 		array = NULL;
 		fences = NULL;
-		if (vm->need_tlb_fence) {
+		if (vm->need_tlb_fence &&
+		    (atomic64_read(&vm->tlb_seq) != tlb_seq ||
+		     vm->last_tlb_inv != previous_tlb)) {
 			/* Earlier PTE flushes may precede the final PDE update. */
 			r = amdgpu_vm_tlb_fence_create(adev, vm, fence, &vm->last_tlb_inv);
 			dma_fence_put(fence);
@@ -1411,6 +1417,7 @@ unlock:
 	list_splice_init(&freed, &vm->freed);
 	drm_exec_fini(&exec);
 out:
+	dma_fence_put(previous_tlb);
 	kfree(batch_entry);
 	kfree(array);
 	kfree(fences);
