@@ -2351,7 +2351,7 @@ int amdgpu_gfx_reset_mes_compute(struct amdgpu_device *adev,
 	struct mes_remove_queue_input *queue_input = (struct mes_remove_queue_input *)faulty_queue_input;
 	struct amdgpu_gfx_deferred_entry deferred_end[AMDGPU_MAX_COMPUTE_RINGS + 1];
 	int n_deferred = 0;
-	int ring_err;
+	int ring_err, resume_err;
 
 	guard(mutex)(&adev->gfx.mec.reset_mutex);
 	/* stop the drm schedulers for all compute queues */
@@ -2440,7 +2440,9 @@ fence_reset:
 
 out:
 	/* resume all will enable the non-hung queues */
-	amdgpu_mes_resume(adev, 0);
+	resume_err = amdgpu_mes_resume(adev, 0);
+	if (resume_err)
+		return r ? r : resume_err;
 
 	/* Now CP is running again — replay backed-up commands and ring
 	 * doorbells on each reset queue.
