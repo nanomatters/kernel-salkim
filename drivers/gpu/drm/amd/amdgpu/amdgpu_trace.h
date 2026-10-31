@@ -321,6 +321,26 @@ DEFINE_EVENT(amdgpu_vm_mapping, amdgpu_vm_bo_cs,
 	    TP_ARGS(mapping)
 );
 
+/* Ranges whose clear update was submitted, not proof of GPU completion. */
+TRACE_EVENT(amdgpu_vm_bo_clear,
+	TP_PROTO(struct amdgpu_vm *vm, struct amdgpu_bo_va_mapping *mapping),
+	TP_ARGS(vm, mapping),
+	TP_STRUCT__entry(
+		__field(u32, pasid)
+		__field(u64, vm_ctx)
+		__field(u64, start)
+		__field(u64, end)
+	),
+	TP_fast_assign(
+		__entry->pasid = vm->pasid;
+		__entry->vm_ctx = vm->immediate.fence_context;
+		__entry->start = mapping->start << AMDGPU_GPU_PAGE_SHIFT;
+		__entry->end = (mapping->last + 1) << AMDGPU_GPU_PAGE_SHIFT;
+	),
+	TP_printk("pasid=%u, vm_ctx=%llu, start=0x%llx, end=0x%llx",
+		  __entry->pasid, __entry->vm_ctx, __entry->start, __entry->end)
+);
+
 TRACE_EVENT(amdgpu_vm_update_ptes,
 	    TP_PROTO(struct amdgpu_vm_update_params *p,
 		     uint64_t start, uint64_t end,
@@ -688,6 +708,25 @@ TRACE_EVENT(amdgpu_userq_wait_deps,
 		      __get_str(dev), __entry->client_id, __entry->queue_type, __entry->doorbell_index, __entry->context,
 		      __entry->dep_context,
 		      __entry->dep_seqno)
+);
+
+TRACE_EVENT(amdgpu_userq_restore,
+	TP_PROTO(struct amdgpu_vm *vm, bool begin, int result),
+	TP_ARGS(vm, begin, result),
+	TP_STRUCT__entry(
+		__field(u32, pasid)
+		__field(u64, vm_ctx)
+		__field(bool, begin)
+		__field(int, result)
+	),
+	TP_fast_assign(
+		__entry->pasid = vm->pasid;
+		__entry->vm_ctx = vm->immediate.fence_context;
+		__entry->begin = begin;
+		__entry->result = result;
+	),
+	TP_printk("pasid=%u, vm_ctx=%llu, begin=%u, result=%d",
+		  __entry->pasid, __entry->vm_ctx, __entry->begin, __entry->result)
 );
 
 TRACE_EVENT(amdgpu_userq_state_start,
