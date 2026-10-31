@@ -22,11 +22,12 @@ class UserqRestoreTests(unittest.TestCase):
                                                  cwd=ROOT, text=True)
             else:
                 source = (ROOT / AMD / file).read_text()
-            match = re.search(r'^(?:static )?int\s+' + name + r'\(.*?^\}', source, re.M | re.S)
+            match = re.search(r'^(?:static )?(?:int|void)\s+' + name + r'\([^;]*?\)\n\{.*?^\}', source, re.M | re.S)
             self.assertIsNotNone(match, name)
             return match.group()
 
         source = HARNESS.replace('ACTUAL_HANDLE_MOVED', function('amdgpu_vm.c', 'amdgpu_vm_handle_moved'))
+        source = source.replace('ACTUAL_UPDATE_DONE', function('amdgpu_vm.c', 'amdgpu_vm_bo_update_done'))
         source = source.replace('ACTUAL_VALIDATE', function('amdgpu_userq.c', 'amdgpu_userq_bo_validate'))
         source = source.replace('ACTUAL_RESTORE', function('amdgpu_userq.c', 'amdgpu_userq_vm_validate_and_restore_queue'))
         flags = shlex.split(os.environ.get('CC', 'cc'))
@@ -86,10 +87,13 @@ struct drm_gem_object { struct dma_resv *resv; bool imported; };
 struct ttm_resource { int mem_type; };
 struct ttm_tt { bool userptr; };
 struct ttm_buffer_object { struct drm_gem_object base; struct ttm_tt *ttm; struct ttm_resource *resource; };
-struct amdgpu_bo { struct ttm_buffer_object tbo; unsigned allowed_domains; int placement; unsigned refs; };
+struct amdgpu_bo { struct ttm_buffer_object tbo; unsigned preferred_domains, allowed_domains; int placement; unsigned refs; };
 struct amdgpu_vm;
+struct amdgpu_vm_bo_base { struct list_head vm_status; struct amdgpu_bo *bo; struct amdgpu_vm *vm; bool moved; };
+struct amdgpu_bo_va_mapping { struct list_head list; uint64_t start, last; };
 struct amdgpu_bo_va {
-    struct { struct list_head vm_status; struct amdgpu_bo *bo; } base;
+    struct amdgpu_vm_bo_base base;
+    struct list_head valids, invalids;
     struct amdgpu_vm *vm;
     void *last_pt_update;
     bool cleared;
@@ -137,6 +141,42 @@ static struct amdgpu_bo_va prt;
 static struct amdgpu_device device;
 static bool move_during_validation;
 static unsigned restored, updates, unlocks;
+static unsigned trace_count, restore_depth, restore_begin, restore_end;
+static int restore_result;
+static bool trace_enabled;
+static struct amdgpu_bo_va_mapping *trace_mappings[8];
+static bool trace_amdgpu_vm_bo_clear_enabled(void) { return trace_enabled; }
+static void trace_amdgpu_vm_bo_clear(struct amdgpu_vm *vm, struct amdgpu_bo_va_mapping *mapping)
+{
+    assert(vm == &fpriv.vm && trace_count < 8);
+    trace_mappings[trace_count++] = mapping;
+}
+static void trace_amdgpu_userq_restore(struct amdgpu_vm *vm, bool begin, int result)
+{
+    assert(vm == &fpriv.vm);
+    if (begin) {
+        assert(!restore_depth && !result);
+        restore_depth++;
+        restore_begin++;
+    } else {
+        assert(restore_depth == 1);
+        restore_depth--;
+        restore_end++;
+        restore_result = result;
+    }
+}
+static bool trace_amdgpu_vm_bo_mapping_enabled(void) { return false; }
+static void trace_amdgpu_vm_bo_mapping(struct amdgpu_bo_va_mapping *mapping) { }
+static bool amdgpu_vm_is_bo_always_valid(struct amdgpu_vm *vm, struct amdgpu_bo *bo) { return false; }
+static unsigned amdgpu_mem_type_to_domain(int type) { return 1u << type; }
+static void amdgpu_vm_bo_idle(struct amdgpu_vm_bo_base *base)
+{ list_move(&base->vm_status, &base->vm->individual.idle); }
+static void list_splice_init(struct list_head *from, struct list_head *to)
+{
+    while (!list_empty(from))
+        list_move(from->prev, to);
+}
+static void amdgpu_vm_bo_update_done(struct amdgpu_bo_va *bo_va, bool clear);
 static int update_error, validation_error;
 
 static void spin_lock(int *lock) { assert(!*lock); *lock = 1; }
@@ -161,12 +201,14 @@ static int amdgpu_vm_bo_update(struct amdgpu_device *adev, struct amdgpu_bo_va *
         updates++;
         if (update_error)
             return update_error;
-        bo_va->cleared = clear;
+        amdgpu_vm_bo_update_done(bo_va, clear);
         bo_va->mapped = !clear && bo_va->base.bo->tbo.resource->mem_type != TTM_PL_SYSTEM;
         list_move(&bo_va->base.vm_status, &bo_va->vm->individual.idle);
     }
     return 0;
 }
+
+ACTUAL_UPDATE_DONE
 
 ACTUAL_HANDLE_MOVED
 
@@ -242,7 +284,9 @@ static void setup(void)
     target_resource = (struct ttm_resource){.mem_type = 1};
     target_bo = (struct amdgpu_bo){.tbo = {.base = {.resv = &target_resv}, .ttm = &target_tt,
                                         .resource = &target_resource}, .refs = 1};
-    target_va = (struct amdgpu_bo_va){.base.bo = &target_bo, .vm = &fpriv.vm};
+    target_va = (struct amdgpu_bo_va){.base = {.bo = &target_bo, .vm = &fpriv.vm}, .vm = &fpriv.vm};
+    list_init(&target_va.valids);
+    list_init(&target_va.invalids);
     device = (struct amdgpu_device){0};
     fpriv.userq_mgr.adev = &device;
     fpriv.prt_va = &prt;
@@ -256,6 +300,10 @@ static void setup(void)
     move_during_validation = false;
     updates = restored = unlocks = 0;
     update_error = validation_error = 0;
+    assert(!restore_depth);
+    trace_count = restore_begin = restore_end = 0;
+    trace_enabled = false;
+    restore_result = 0;
 }
 
 int main(void)
@@ -321,7 +369,28 @@ int main(void)
     validation_error = -ENOMEM;
     assert(amdgpu_userq_vm_validate_and_restore_queue(&fpriv.userq_mgr) == -ENOMEM);
     assert(!restored && !updates && !target_resv.owner && target_bo.refs == 1);
-    puts("UserQ restore: 13 reservation, residency and failure cases passed");
+    assert(restore_begin == 1 && restore_end == 1 && restore_result == -ENOMEM);
+    for (unsigned mode = 0; mode < 4; mode++) {
+        setup();
+        struct amdgpu_bo_va_mapping ranges[2] = {{.start = 10, .last = 12}, {.start = 20, .last = 25}};
+        for (unsigned i = 0; i < 2; i++)
+            list_add(&ranges[i].list, &target_va.invalids);
+        trace_enabled = mode != 0;
+        if (mode == 3)
+            update_error = -ENOMEM;
+        bool clear = mode != 1;
+        assert(amdgpu_vm_bo_update(&device, &target_va, clear) == update_error);
+        assert(trace_count == (mode == 2 ? 2 : 0));
+        if (mode == 2) {
+            assert(trace_mappings[0] == &ranges[1] && trace_mappings[1] == &ranges[0]);
+            assert(amdgpu_vm_bo_update(&device, &target_va, true) == 0);
+            assert(trace_count == 2);
+        }
+    }
+    setup();
+    assert(amdgpu_userq_vm_validate_and_restore_queue(&fpriv.userq_mgr) == 0);
+    assert(restore_begin == 1 && restore_end == 1 && !restore_result);
+    puts("UserQ restore: 13 reservation cases and clear/restore diagnostics passed");
     return 0;
 }
 '''
