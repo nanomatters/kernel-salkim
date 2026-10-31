@@ -90,6 +90,14 @@ struct amdgpu_usermode_queue {
 	 * Delayed work which runs when userq_fences time out.
 	 */
 	struct delayed_work	hang_detect_work;
+	/* Protects watchdog state and deadlines against IRQ handlers. */
+	spinlock_t		hang_detect_lock;
+	unsigned long		hang_detect_deadline;
+	u64			hang_detect_progress;
+	bool			hang_detect_armed;
+	bool			hang_detect_stopped;
+	bool			hang_detect_paused;
+	bool			hang_detect_reset_requested;
 	struct kref		refcount;
 
 	union {
@@ -185,6 +193,10 @@ void amdgpu_userq_reset_work(struct work_struct *work);
 void amdgpu_userq_pre_reset(struct amdgpu_device *adev);
 int amdgpu_userq_post_reset(struct amdgpu_device *adev, bool vram_lost);
 void amdgpu_userq_start_hang_detect_work(struct amdgpu_usermode_queue *queue);
+void amdgpu_userq_pause_hang_detect_work(struct amdgpu_usermode_queue *queue);
+void amdgpu_userq_resume_hang_detect_work(struct amdgpu_usermode_queue *queue);
+void amdgpu_userq_stop_hang_detect_work(struct amdgpu_usermode_queue *queue);
+void amdgpu_userq_request_reset(struct amdgpu_usermode_queue *queue);
 void amdgpu_userq_process_fence_irq(struct amdgpu_device *adev, u32 doorbell);
 
 /*
