@@ -55,7 +55,7 @@ class UserqTests(unittest.TestCase):
         flags = shlex.split(os.environ.get('CC', 'cc'))
         flags += ['-std=gnu11', '-O1', '-g', '-Wall', '-Wextra', '-Werror',
                   '-Wno-unused-parameter', '-Wno-sign-compare',
-                  '-I' + str(ROOT / 'include/uapi/drm')]
+                  '-D__user=', '-I' + str(ROOT / 'include/uapi/drm')]
         flags += shlex.split(subprocess.check_output(
             ['pkg-config', '--cflags', 'libdrm'], text=True))
         if os.environ.get('USERQ_TEST_SANITIZERS'):
