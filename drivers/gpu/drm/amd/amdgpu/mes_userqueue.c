@@ -225,13 +225,25 @@ int mes_userq_reset_hw(struct amdgpu_usermode_queue *queue,
 	if (r)
 		return r;
 
+	return mes_userq_cancel(queue);
+}
+
+/* The caller must stop queue execution before cancelling it. */
+int mes_userq_cancel(struct amdgpu_usermode_queue *queue)
+{
+	int r;
+
+	guard(mutex)(&queue->state_mutex);
+	if (queue->state == AMDGPU_USERQ_STATE_CANCELED)
+		return 0;
+
 	r = mes_userq_unmap(queue);
 	if (r)
 		return r;
 
-	/* Prevent the restore worker from resubmitting the guilty job. */
-	trace_amdgpu_userq_state_changed(queue, AMDGPU_USERQ_STATE_HUNG);
-	queue->state = AMDGPU_USERQ_STATE_HUNG;
+	/* A removed queue must never replay work after its fences are cancelled. */
+	trace_amdgpu_userq_state_changed(queue, AMDGPU_USERQ_STATE_CANCELED);
+	queue->state = AMDGPU_USERQ_STATE_CANCELED;
 	return 0;
 }
 
@@ -241,9 +253,12 @@ int mes_userq_reset(struct amdgpu_usermode_queue *queue)
 	struct amdgpu_device *adev = uq_mgr->adev;
 	struct mes_reset_queue_input queue_input;
 
-	/* already reset by an earlier job's hang-detect; just signal and bail */
-	if (queue->state == AMDGPU_USERQ_STATE_HUNG)
-		return 0;
+	/* A cancelled queue has already been removed from hardware. */
+	{
+		guard(mutex)(&queue->state_mutex);
+		if (queue->state == AMDGPU_USERQ_STATE_CANCELED)
+			return 0;
+	}
 
 	/* A GFX pipe reset also affects the kernel rings on that pipe. */
 	if (queue->queue_type == AMDGPU_HW_IP_GFX &&
@@ -289,7 +304,7 @@ int mes_userq_reset_queue(struct amdgpu_device *adev,
 {
 	struct amdgpu_usermode_queue *uq;
 	bool use_mmio = adev->gfx.mec.use_mmio_for_reset;
-	unsigned long uq_id;
+	unsigned long uq_id, flags;
 	int r;
 
 	xa_for_each(&adev->userq_doorbell_xa, uq_id, uq) {
@@ -297,14 +312,26 @@ int mes_userq_reset_queue(struct amdgpu_device *adev,
 			if (uq == guilty_uq)
 				continue;
 			if (uq->doorbell_index == db) {
+				mutex_lock(&uq->state_mutex);
+				if (uq->state == AMDGPU_USERQ_STATE_CANCELED) {
+					mutex_unlock(&uq->state_mutex);
+					break;
+				}
+				spin_lock_irqsave(&uq->hang_detect_lock, flags);
+				uq->hang_detect_stopped = true;
+				uq->hang_detect_armed = false;
+				uq->hang_detect_reset_requested = false;
 				uq->state = AMDGPU_USERQ_STATE_HUNG;
+				spin_unlock_irqrestore(&uq->hang_detect_lock, flags);
+				cancel_delayed_work(&uq->hang_detect_work);
+				mutex_unlock(&uq->state_mutex);
 				if (use_mmio)
 					r = amdgpu_mes_reset_queue_mmio(adev, queue_type, 0, 1, pipe, queue, 0);
 				else
 					r = amdgpu_mes_reset_user_queue(adev, queue_type, db, 0);
 				if (r)
 					return r;
-				r = mes_userq_unmap(uq);
+				r = mes_userq_cancel(uq);
 				if (r)
 					return r;
 				amdgpu_userq_fence_driver_force_completion(uq);
