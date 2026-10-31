@@ -1507,6 +1507,11 @@ static void amdgpu_vm_bo_update_done(struct amdgpu_bo_va *bo_va, bool clear)
 		amdgpu_vm_bo_idle(&bo_va->base);
 	}
 
+	if (clear && trace_amdgpu_vm_bo_clear_enabled()) {
+		list_for_each_entry(mapping, &bo_va->invalids, list)
+			trace_amdgpu_vm_bo_clear(vm, mapping);
+	}
+
 	list_splice_init(&bo_va->invalids, &bo_va->valids);
 	bo_va->cleared = clear;
 	bo_va->base.moved = false;

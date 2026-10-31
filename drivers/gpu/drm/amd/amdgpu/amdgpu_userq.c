@@ -1172,6 +1172,7 @@ amdgpu_userq_vm_validate_and_restore_queue(struct amdgpu_userq_mgr *uq_mgr)
 	struct xarray xa;
 	int ret;
 
+	trace_amdgpu_userq_restore(vm, true, 0);
 	xa_init(&xa);
 
 retry_lock:
@@ -1364,6 +1365,7 @@ free_ranges:
 		amdgpu_hmm_range_free(range);
 	}
 	xa_destroy(&xa);
+	trace_amdgpu_userq_restore(vm, false, ret);
 	return ret;
 }
 
