@@ -115,6 +115,108 @@ static void amdgpu_userq_mgr_reset_work(struct work_struct *work)
 	amdgpu_device_gpu_recover(adev, NULL, &reset_context);
 }
 
+static unsigned long amdgpu_userq_hang_timeout(struct amdgpu_usermode_queue *queue)
+{
+	struct amdgpu_device *adev = queue->userq_mgr->adev;
+
+	switch (queue->queue_type) {
+	case AMDGPU_RING_TYPE_COMPUTE:
+		return adev->compute_timeout;
+	case AMDGPU_RING_TYPE_SDMA:
+		return adev->sdma_timeout;
+	default:
+		return adev->gfx_timeout;
+	}
+}
+
+static void amdgpu_userq_arm_hang_detect_work(struct amdgpu_usermode_queue *queue)
+{
+	struct amdgpu_device *adev = queue->userq_mgr->adev;
+	unsigned long delay;
+	u64 progress;
+
+	lockdep_assert_held(&queue->hang_detect_lock);
+	if (queue->hang_detect_stopped)
+		return;
+	if (queue->hang_detect_reset_requested) {
+		mod_delayed_work(adev->reset_domain->wq, &queue->hang_detect_work, 0);
+		return;
+	}
+	if (queue->hang_detect_paused || READ_ONCE(queue->state) != AMDGPU_USERQ_STATE_MAPPED)
+		return;
+	if (!amdgpu_userq_fence_has_pending(queue, &progress)) {
+		queue->hang_detect_armed = false;
+		cancel_delayed_work(&queue->hang_detect_work);
+		return;
+	}
+	if (!queue->hang_detect_armed || progress != queue->hang_detect_progress) {
+		queue->hang_detect_progress = progress;
+		queue->hang_detect_deadline = jiffies + amdgpu_userq_hang_timeout(queue);
+		queue->hang_detect_armed = true;
+	}
+	delay = time_before(jiffies, queue->hang_detect_deadline) ?
+		queue->hang_detect_deadline - jiffies : 0;
+	mod_delayed_work(adev->reset_domain->wq, &queue->hang_detect_work, delay);
+}
+
+void amdgpu_userq_start_hang_detect_work(struct amdgpu_usermode_queue *queue)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&queue->hang_detect_lock, flags);
+	amdgpu_userq_arm_hang_detect_work(queue);
+	spin_unlock_irqrestore(&queue->hang_detect_lock, flags);
+}
+
+void amdgpu_userq_pause_hang_detect_work(struct amdgpu_usermode_queue *queue)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&queue->hang_detect_lock, flags);
+	queue->hang_detect_paused = true;
+	queue->hang_detect_armed = false;
+	if (!queue->hang_detect_reset_requested)
+		cancel_delayed_work(&queue->hang_detect_work);
+	spin_unlock_irqrestore(&queue->hang_detect_lock, flags);
+}
+
+void amdgpu_userq_resume_hang_detect_work(struct amdgpu_usermode_queue *queue)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&queue->hang_detect_lock, flags);
+	queue->hang_detect_paused = false;
+	queue->hang_detect_armed = false;
+	amdgpu_userq_arm_hang_detect_work(queue);
+	spin_unlock_irqrestore(&queue->hang_detect_lock, flags);
+}
+
+void amdgpu_userq_stop_hang_detect_work(struct amdgpu_usermode_queue *queue)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&queue->hang_detect_lock, flags);
+	queue->hang_detect_stopped = true;
+	queue->hang_detect_armed = false;
+	queue->hang_detect_reset_requested = false;
+	spin_unlock_irqrestore(&queue->hang_detect_lock, flags);
+	cancel_delayed_work_sync(&queue->hang_detect_work);
+}
+
+void amdgpu_userq_request_reset(struct amdgpu_usermode_queue *queue)
+{
+	struct amdgpu_device *adev = queue->userq_mgr->adev;
+	unsigned long flags;
+
+	spin_lock_irqsave(&queue->hang_detect_lock, flags);
+	if (!amdgpu_in_reset(adev) && !queue->hang_detect_stopped &&
+	    READ_ONCE(queue->state) != AMDGPU_USERQ_STATE_CANCELED) {
+		queue->hang_detect_reset_requested = true;
+		amdgpu_userq_arm_hang_detect_work(queue);
+	}
+	spin_unlock_irqrestore(&queue->hang_detect_lock, flags);
+}
+
 static void amdgpu_userq_hang_detect_work(struct work_struct *work)
 {
 	struct amdgpu_usermode_queue *queue =
@@ -126,23 +228,62 @@ static void amdgpu_userq_hang_detect_work(struct work_struct *work)
 		adev->userq_funcs[queue->queue_type];
 	struct drm_wedge_task_info *info = NULL;
 	struct amdgpu_task_info *ti = NULL;
-	bool gpu_reset = false;
+	bool gpu_reset = false, reset = false, cancel_only = false;
+	bool process_fences = false;
+	unsigned long flags;
+	u64 progress;
 
-	if (unlikely(adev->debug_disable_gpu_ring_reset)) {
-		dev_err(adev->dev, "userq reset disabled by debug mask\n");
+	if (unlikely(adev->debug_disable_gpu_ring_reset) || !amdgpu_gpu_recovery ||
+	    amdgpu_in_reset(adev))
+		return;
+
+	/* Eviction can hold userq_mutex while waiting for the fence we must recover. */
+	mutex_lock(&queue->state_mutex);
+	spin_lock_irqsave(&queue->hang_detect_lock, flags);
+	if (queue->hang_detect_stopped)
+		goto unlock;
+	if (!queue->hang_detect_reset_requested) {
+		if (queue->hang_detect_paused || queue->state != AMDGPU_USERQ_STATE_MAPPED ||
+		    !queue->hang_detect_armed)
+			goto unlock;
+		if (!amdgpu_userq_fence_has_pending(queue, &progress)) {
+			queue->hang_detect_armed = false;
+			process_fences = true;
+			goto unlock;
+		}
+		if (progress != queue->hang_detect_progress) {
+			queue->hang_detect_progress = progress;
+			queue->hang_detect_deadline = jiffies + amdgpu_userq_hang_timeout(queue);
+			process_fences = true;
+		}
+		if (time_before(jiffies, queue->hang_detect_deadline)) {
+			amdgpu_userq_arm_hang_detect_work(queue);
+			goto unlock;
+		}
+	} else if (queue->state != AMDGPU_USERQ_STATE_MAPPED &&
+		   queue->state != AMDGPU_USERQ_STATE_PREEMPTED &&
+		   queue->state != AMDGPU_USERQ_STATE_HUNG) {
+		queue->hang_detect_reset_requested = false;
+		if (queue->state != AMDGPU_USERQ_STATE_UNMAPPED)
+			goto unlock;
+		cancel_only = true;
+	}
+	queue->hang_detect_stopped = true;
+	queue->hang_detect_armed = false;
+	queue->hang_detect_reset_requested = false;
+	queue->state = cancel_only ? AMDGPU_USERQ_STATE_CANCELED : AMDGPU_USERQ_STATE_HUNG;
+	reset = true;
+unlock:
+	spin_unlock_irqrestore(&queue->hang_detect_lock, flags);
+	mutex_unlock(&queue->state_mutex);
+	if (process_fences)
+		amdgpu_userq_fence_driver_process(queue->fence_drv);
+	if (!reset)
+		return;
+	if (cancel_only) {
+		amdgpu_userq_fence_driver_force_completion(queue);
 		return;
 	}
-
-	/*
-	 * If GPU recovery feature is disabled system-wide,
-	 * skip all reset detection logic
-	 */
-	if (!amdgpu_gpu_recovery)
-		return;
-
-	mutex_lock(&queue->state_mutex);
-	queue->state = AMDGPU_USERQ_STATE_HUNG;
-	mutex_unlock(&queue->state_mutex);
 
 	if (queue->vm && queue->vm->pasid) {
 		ti = amdgpu_vm_get_task_info_pasid(adev, queue->vm->pasid);
@@ -173,42 +314,9 @@ static void amdgpu_userq_hang_detect_work(struct work_struct *work)
 	}
 	amdgpu_vm_put_task_info(ti);
 
-	/*
-	 * Don't schedule the work here! Scheduling or queue work from one reset
-	 * handler to another is illegal if you don't take extra precautions!
-	 */
+	/* The reset worker must not enqueue another reset on the same workqueue. */
 	if (gpu_reset)
 		amdgpu_userq_mgr_reset_work(&queue->userq_mgr->reset_work);
-}
-
-/*
- * Start hang detection for a user queue fence. A delayed work will be scheduled
- * to reset the queues when the fence doesn't signal in time.
- */
-void amdgpu_userq_start_hang_detect_work(struct amdgpu_usermode_queue *queue)
-{
-	struct amdgpu_device *adev;
-	unsigned long timeout_jiffies;
-
-	adev = queue->userq_mgr->adev;
-	/* Determine timeout based on queue type */
-	switch (queue->queue_type) {
-	case AMDGPU_RING_TYPE_GFX:
-		timeout_jiffies = adev->gfx_timeout;
-		break;
-	case AMDGPU_RING_TYPE_COMPUTE:
-		timeout_jiffies = adev->compute_timeout;
-		break;
-	case AMDGPU_RING_TYPE_SDMA:
-		timeout_jiffies = adev->sdma_timeout;
-		break;
-	default:
-		timeout_jiffies = adev->gfx_timeout;
-		break;
-	}
-
-	queue_delayed_work(adev->reset_domain->wq, &queue->hang_detect_work,
-			   timeout_jiffies);
 }
 
 void amdgpu_userq_process_fence_irq(struct amdgpu_device *adev, u32 doorbell)
@@ -216,22 +324,12 @@ void amdgpu_userq_process_fence_irq(struct amdgpu_device *adev, u32 doorbell)
 	struct xarray *xa = &adev->userq_doorbell_xa;
 	struct amdgpu_usermode_queue *queue;
 	unsigned long flags;
-	int r;
 
 	xa_lock_irqsave(xa, flags);
 	queue = xa_load(xa, doorbell);
 	if (queue) {
-		r = amdgpu_userq_fence_driver_process(queue->fence_drv);
-		/*
-		 * We are in interrupt context here, this *can't* wait for
-		 * reset work to finish.
-		 */
-		if (r >= 0)
-			cancel_delayed_work(&queue->hang_detect_work);
-
-		/* Restart the timer when there are still fences pending */
-		if (r == 1)
-			amdgpu_userq_start_hang_detect_work(queue);
+		amdgpu_userq_fence_driver_process(queue->fence_drv);
+		amdgpu_userq_start_hang_detect_work(queue);
 	}
 	xa_unlock_irqrestore(xa, flags);
 }
@@ -323,10 +421,12 @@ static int amdgpu_userq_preempt_helper(struct amdgpu_usermode_queue *queue)
 	if (queue->state == AMDGPU_USERQ_STATE_MAPPED) {
 		trace_amdgpu_userq_state_start(queue);
 
+		amdgpu_userq_pause_hang_detect_work(queue);
 		r = userq_funcs->preempt(queue);
 		if (r) {
 			trace_amdgpu_userq_state_changed(queue, AMDGPU_USERQ_STATE_HUNG);
 			queue->state = AMDGPU_USERQ_STATE_HUNG;
+			amdgpu_userq_request_reset(queue);
 			return r;
 		} else {
 			trace_amdgpu_userq_state_changed(queue, AMDGPU_USERQ_STATE_PREEMPTED);
@@ -346,16 +446,19 @@ static int amdgpu_userq_restore_helper(struct amdgpu_usermode_queue *queue)
 
 	guard(mutex)(&queue->state_mutex);
 
-	if (queue->state == AMDGPU_USERQ_STATE_PREEMPTED) {
+	if (queue->state == AMDGPU_USERQ_STATE_PREEMPTED &&
+	    !READ_ONCE(queue->hang_detect_stopped)) {
 		trace_amdgpu_userq_state_start(queue);
 
 		r = userq_funcs->restore(queue);
 		if (r) {
 			trace_amdgpu_userq_state_changed(queue, AMDGPU_USERQ_STATE_HUNG);
 			queue->state = AMDGPU_USERQ_STATE_HUNG;
+			amdgpu_userq_request_reset(queue);
 		} else {
 			trace_amdgpu_userq_state_changed(queue, AMDGPU_USERQ_STATE_MAPPED);
 			queue->state = AMDGPU_USERQ_STATE_MAPPED;
+			amdgpu_userq_resume_hang_detect_work(queue);
 		}
 	}
 
@@ -378,6 +481,7 @@ static int amdgpu_userq_unmap_helper(struct amdgpu_usermode_queue *queue)
 	    (queue->state == AMDGPU_USERQ_STATE_PREEMPTED)) {
 		trace_amdgpu_userq_state_start(queue);
 
+		amdgpu_userq_pause_hang_detect_work(queue);
 		r = userq_funcs->unmap(queue);
 		if (r) {
 			trace_amdgpu_userq_state_changed(queue, AMDGPU_USERQ_STATE_HUNG);
@@ -404,17 +508,23 @@ static int amdgpu_userq_map_helper(struct amdgpu_usermode_queue *queue)
 	guard(rwsem_read)(&adev->reset_domain->sem);
 	guard(mutex)(&queue->state_mutex);
 
-	if (queue->state == AMDGPU_USERQ_STATE_UNMAPPED) {
+	if (queue->state == AMDGPU_USERQ_STATE_UNMAPPED &&
+	    !READ_ONCE(queue->hang_detect_stopped)) {
 		trace_amdgpu_userq_state_start(queue);
 
 		r = userq_funcs->map(queue);
 		if (r) {
+			u64 progress;
+
 			trace_amdgpu_userq_state_changed(queue, AMDGPU_USERQ_STATE_HUNG);
 			queue->state = AMDGPU_USERQ_STATE_HUNG;
+			if (amdgpu_userq_fence_has_pending(queue, &progress))
+				amdgpu_userq_request_reset(queue);
 			return r;
 		} else {
 			trace_amdgpu_userq_state_changed(queue, AMDGPU_USERQ_STATE_MAPPED);
 			queue->state = AMDGPU_USERQ_STATE_MAPPED;
+			amdgpu_userq_resume_hang_detect_work(queue);
 		}
 	}
 
@@ -567,13 +677,12 @@ amdgpu_userq_destroy(struct amdgpu_userq_mgr *uq_mgr, struct amdgpu_usermode_que
 	trace_amdgpu_userq_destroy_start(queue);
 
 	cancel_delayed_work_sync(&uq_mgr->resume_work);
-	/* Cancel before taking userq_mutex: cancel_delayed_work_sync() waits
-	 * for any running instance, which itself takes userq_mutex.
-	 */
-	cancel_delayed_work_sync(&queue->hang_detect_work);
-
+	/* Keep recovery available until the final submission completes. */
 	mutex_lock(&uq_mgr->userq_mutex);
 	amdgpu_userq_wait_for_last_fence(queue);
+	mutex_unlock(&uq_mgr->userq_mutex);
+	amdgpu_userq_stop_hang_detect_work(queue);
+	mutex_lock(&uq_mgr->userq_mutex);
 
 	amdgpu_userq_detach_doorbell(queue);
 
@@ -698,6 +807,8 @@ amdgpu_userq_create(struct drm_file *filp, union drm_amdgpu_userq *args)
 	}
 
 	mutex_init(&queue->state_mutex);
+	spin_lock_init(&queue->hang_detect_lock);
+	queue->hang_detect_paused = true;
 	kref_init(&queue->refcount);
 	queue->doorbell_handle = args->in.doorbell_handle;
 	queue->queue_type = args->in.ip_type;
@@ -802,6 +913,7 @@ amdgpu_userq_create(struct drm_file *filp, union drm_amdgpu_userq *args)
 
 erase_doorbell:
 	xa_erase_irq(&adev->userq_doorbell_xa, index);
+	amdgpu_userq_stop_hang_detect_work(queue);
 clean_mqd:
 	uq_funcs->mqd_destroy(queue);
 clean_doorbell_bo:
@@ -966,6 +1078,7 @@ amdgpu_userq_restore_all(struct amdgpu_userq_mgr *uq_mgr)
 			mutex_lock(&queue->state_mutex);
 			if (queue->state != AMDGPU_USERQ_STATE_HUNG &&
 			    queue->state != AMDGPU_USERQ_STATE_CANCELED) {
+				amdgpu_userq_pause_hang_detect_work(queue);
 				trace_amdgpu_userq_state_changed(queue,
 								 AMDGPU_USERQ_STATE_INVALID_VA);
 				queue->state = AMDGPU_USERQ_STATE_INVALID_VA;
@@ -1319,7 +1432,7 @@ void amdgpu_userq_process_reset_irq(struct amdgpu_device *adev,
 	xa_for_each(xa, idx, queue) {
 		if (queue->vm && queue->vm->pasid == pasid &&
 		    queue->doorbell_offset == doorbell_offset) {
-			amdgpu_userq_start_hang_detect_work(queue);
+			amdgpu_userq_request_reset(queue);
 			break;
 		}
 	}
@@ -1466,8 +1579,10 @@ int amdgpu_userq_suspend(struct amdgpu_device *adev)
 			r = amdgpu_userq_preempt_helper(queue);
 		else
 			r = amdgpu_userq_unmap_helper(queue);
-		if (r)
+		if (r) {
+			amdgpu_userq_request_reset(queue);
 			return r;
+		}
 	}
 	return 0;
 }
@@ -1591,7 +1706,13 @@ void amdgpu_userq_pre_reset(struct amdgpu_device *adev)
 	unsigned long queue_id;
 
 	xa_for_each(&adev->userq_doorbell_xa, queue_id, queue) {
+		unsigned long flags;
+
 		guard(mutex)(&queue->state_mutex);
+		amdgpu_userq_pause_hang_detect_work(queue);
+		spin_lock_irqsave(&queue->hang_detect_lock, flags);
+		queue->hang_detect_reset_requested = false;
+		spin_unlock_irqrestore(&queue->hang_detect_lock, flags);
 		if (queue->state == AMDGPU_USERQ_STATE_MAPPED) {
 			trace_amdgpu_userq_state_start(queue);
 			userq_funcs = adev->userq_funcs[queue->queue_type];
@@ -1624,7 +1745,8 @@ int amdgpu_userq_post_reset(struct amdgpu_device *adev, bool vram_lost)
 
 	xa_for_each(&adev->userq_doorbell_xa, queue_id, queue) {
 		guard(mutex)(&queue->state_mutex);
-		if (queue->state == AMDGPU_USERQ_STATE_HUNG && !vram_lost) {
+		if (queue->state == AMDGPU_USERQ_STATE_HUNG && !vram_lost &&
+		    !READ_ONCE(queue->hang_detect_stopped)) {
 			trace_amdgpu_userq_state_start(queue);
 
 			userq_funcs = adev->userq_funcs[queue->queue_type];
@@ -1637,6 +1759,7 @@ int amdgpu_userq_post_reset(struct amdgpu_device *adev, bool vram_lost)
 			}
 			trace_amdgpu_userq_state_changed(queue, AMDGPU_USERQ_STATE_MAPPED);
 			queue->state = AMDGPU_USERQ_STATE_MAPPED;
+			amdgpu_userq_resume_hang_detect_work(queue);
 		}
 	}
 

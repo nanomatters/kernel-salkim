@@ -118,12 +118,13 @@ struct drm_syncobj { unsigned refs; };
 struct amdgpu_usermode_queue {
     unsigned refs, state;
     int state_mutex;
+    bool hang_detect_stopped;
 };
 
 enum failure {
     NONE, DISABLED, READ_LOOKUP, WRITE_LOOKUP, QUEUE_LOOKUP,
     WPTR_READ, FENCE_ALLOC, READ_PREPARE, WRITE_PREPARE,
-    QUEUE_HUNG, QUEUE_CANCELED, QUEUE_INVALID_VA,
+    QUEUE_HUNG, QUEUE_CANCELED, QUEUE_INVALID_VA, QUEUE_STOPPED,
 };
 static enum failure failure;
 static unsigned alloc_count, fail_alloc, live_allocs, published, chains_owned;
@@ -251,7 +252,7 @@ static int amdgpu_userq_fence_read_wptr(struct amdgpu_device *dev,
 static int amdgpu_userq_fence_alloc(struct amdgpu_usermode_queue *q,
                                     struct amdgpu_userq_fence **out)
 {
-    assert(q->state_mutex);
+    assert(q->state_mutex && !q->hang_detect_stopped);
     assert(q->state != AMDGPU_USERQ_STATE_HUNG &&
            q->state != AMDGPU_USERQ_STATE_CANCELED &&
            q->state != AMDGPU_USERQ_STATE_INVALID_VA);
@@ -341,7 +342,8 @@ static void run_case(unsigned count, unsigned mask, bool points_present, bool le
     queue.state = fail == QUEUE_HUNG ? AMDGPU_USERQ_STATE_HUNG :
                   fail == QUEUE_CANCELED ? AMDGPU_USERQ_STATE_CANCELED :
                   fail == QUEUE_INVALID_VA ? AMDGPU_USERQ_STATE_INVALID_VA :
-                  1;
+                  fail == QUEUE_STOPPED ? AMDGPU_USERQ_STATE_UNMAPPED : 1;
+    queue.hang_detect_stopped = fail == QUEUE_STOPPED;
     struct amdgpu_fpriv fpriv = {0};
     struct drm_file file = { .driver_priv = &fpriv };
     struct drm_device dev = {0};
@@ -393,6 +395,7 @@ int main(void)
     run_case(3, 7, true, false, QUEUE_HUNG, 0, 0, 0, false, -ECANCELED);
     run_case(3, 7, true, false, QUEUE_CANCELED, 0, 0, 0, false, -ECANCELED);
     run_case(3, 7, true, false, QUEUE_INVALID_VA, 0, 0, 0, false, -ECANCELED);
+    run_case(3, 7, true, false, QUEUE_STOPPED, 0, 0, 0, false, -ECANCELED);
     printf("USERQ_SIGNAL: %u cases passed\n", cases);
     return 0;
 }
