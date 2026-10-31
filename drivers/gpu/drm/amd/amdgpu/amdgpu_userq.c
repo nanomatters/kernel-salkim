@@ -140,6 +140,10 @@ static void amdgpu_userq_hang_detect_work(struct work_struct *work)
 	if (!amdgpu_gpu_recovery)
 		return;
 
+	mutex_lock(&queue->state_mutex);
+	queue->state = AMDGPU_USERQ_STATE_HUNG;
+	mutex_unlock(&queue->state_mutex);
+
 	if (queue->vm && queue->vm->pasid) {
 		ti = amdgpu_vm_get_task_info_pasid(adev, queue->vm->pasid);
 		if (ti) {
@@ -314,6 +318,8 @@ static int amdgpu_userq_preempt_helper(struct amdgpu_usermode_queue *queue)
 		adev->userq_funcs[queue->queue_type];
 	int r;
 
+	guard(mutex)(&queue->state_mutex);
+
 	if (queue->state == AMDGPU_USERQ_STATE_MAPPED) {
 		trace_amdgpu_userq_state_start(queue);
 
@@ -337,6 +343,8 @@ static int amdgpu_userq_restore_helper(struct amdgpu_usermode_queue *queue)
 	const struct amdgpu_userq_funcs *userq_funcs =
 		adev->userq_funcs[queue->queue_type];
 	int r = 0;
+
+	guard(mutex)(&queue->state_mutex);
 
 	if (queue->state == AMDGPU_USERQ_STATE_PREEMPTED) {
 		trace_amdgpu_userq_state_start(queue);
@@ -364,6 +372,8 @@ static int amdgpu_userq_unmap_helper(struct amdgpu_usermode_queue *queue)
 
 	/* The reset changes the queue state and the MES is unusable meanwhile */
 	guard(rwsem_read)(&adev->reset_domain->sem);
+	guard(mutex)(&queue->state_mutex);
+
 	if ((queue->state == AMDGPU_USERQ_STATE_MAPPED) ||
 	    (queue->state == AMDGPU_USERQ_STATE_PREEMPTED)) {
 		trace_amdgpu_userq_state_start(queue);
@@ -392,6 +402,8 @@ static int amdgpu_userq_map_helper(struct amdgpu_usermode_queue *queue)
 
 	/* The reset changes the queue state and the MES is unusable meanwhile */
 	guard(rwsem_read)(&adev->reset_domain->sem);
+	guard(mutex)(&queue->state_mutex);
+
 	if (queue->state == AMDGPU_USERQ_STATE_UNMAPPED) {
 		trace_amdgpu_userq_state_start(queue);
 
@@ -592,6 +604,7 @@ amdgpu_userq_destroy(struct amdgpu_userq_mgr *uq_mgr, struct amdgpu_usermode_que
 	amdgpu_bo_unref(&queue->db_obj.obj);
 
 	trace_amdgpu_userq_destroy_end(queue, r);
+	mutex_destroy(&queue->state_mutex);
 	kfree(queue);
 
 	pm_runtime_put_autosuspend(adev_to_drm(adev)->dev);
@@ -684,6 +697,7 @@ amdgpu_userq_create(struct drm_file *filp, union drm_amdgpu_userq *args)
 		goto err_pm_runtime;
 	}
 
+	mutex_init(&queue->state_mutex);
 	kref_init(&queue->refcount);
 	queue->doorbell_handle = args->in.doorbell_handle;
 	queue->queue_type = args->in.ip_type;
@@ -799,6 +813,7 @@ free_fence_drv:
 	amdgpu_userq_fence_driver_free(queue);
 free_queue:
 	trace_amdgpu_userq_create_end(queue, r);
+	mutex_destroy(&queue->state_mutex);
 	kfree(queue);
 err_pm_runtime:
 	pm_runtime_put_autosuspend(adev_to_drm(adev)->dev);
@@ -948,8 +963,14 @@ amdgpu_userq_restore_all(struct amdgpu_userq_mgr *uq_mgr)
 		if (!amdgpu_userq_buffer_vas_mapped(queue)) {
 			drm_file_err(uq_mgr->file,
 				     "trying restore queue without va mapping\n");
-			trace_amdgpu_userq_state_changed(queue, AMDGPU_USERQ_STATE_INVALID_VA);
-			queue->state = AMDGPU_USERQ_STATE_INVALID_VA;
+			mutex_lock(&queue->state_mutex);
+			if (queue->state != AMDGPU_USERQ_STATE_HUNG &&
+			    queue->state != AMDGPU_USERQ_STATE_CANCELED) {
+				trace_amdgpu_userq_state_changed(queue,
+								 AMDGPU_USERQ_STATE_INVALID_VA);
+				queue->state = AMDGPU_USERQ_STATE_INVALID_VA;
+			}
+			mutex_unlock(&queue->state_mutex);
 			continue;
 		}
 
@@ -1569,8 +1590,8 @@ void amdgpu_userq_pre_reset(struct amdgpu_device *adev)
 	struct amdgpu_usermode_queue *queue;
 	unsigned long queue_id;
 
-	/* TODO: We probably need a new lock for the queue state */
 	xa_for_each(&adev->userq_doorbell_xa, queue_id, queue) {
+		guard(mutex)(&queue->state_mutex);
 		if (queue->state == AMDGPU_USERQ_STATE_MAPPED) {
 			trace_amdgpu_userq_state_start(queue);
 			userq_funcs = adev->userq_funcs[queue->queue_type];
@@ -1602,6 +1623,7 @@ int amdgpu_userq_post_reset(struct amdgpu_device *adev, bool vram_lost)
 	int ret = 0, r;
 
 	xa_for_each(&adev->userq_doorbell_xa, queue_id, queue) {
+		guard(mutex)(&queue->state_mutex);
 		if (queue->state == AMDGPU_USERQ_STATE_HUNG && !vram_lost) {
 			trace_amdgpu_userq_state_start(queue);
 
