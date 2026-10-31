@@ -15,7 +15,7 @@ AMD = ROOT / 'drivers/gpu/drm/amd/amdgpu'
 class VaBatchTests(unittest.TestCase):
     def test_request_layout(self):
         flags = shlex.split(os.environ.get('CC', 'cc'))
-        flags += ['-std=gnu11', '-Werror', '-I' + str(ROOT / 'include/uapi/drm')]
+        flags += ['-std=gnu11', '-Werror', '-D__user=', '-I' + str(ROOT / 'include/uapi/drm')]
         flags += shlex.split(subprocess.check_output(['pkg-config', '--cflags', 'libdrm'], text=True))
         with tempfile.TemporaryDirectory(prefix='va-batch-abi-') as temporary:
             directory = pathlib.Path(temporary)
@@ -55,7 +55,7 @@ class VaBatchTests(unittest.TestCase):
         flags = shlex.split(os.environ.get('CC', 'cc'))
         flags += ['-std=gnu11', '-O1', '-g', '-Wall', '-Wextra', '-Werror',
                   '-Wno-unused-parameter', '-Wno-unused-function', '-Wno-sign-compare', '-pthread',
-                  '-I' + str(ROOT / 'include/uapi/drm')]
+                  '-D__user=', '-I' + str(ROOT / 'include/uapi/drm')]
         flags += shlex.split(subprocess.check_output(['pkg-config', '--cflags', 'libdrm'], text=True))
         if os.environ.get('USERQ_TEST_SANITIZERS'):
             flags += ['-fsanitize=address,undefined', '-fno-omit-frame-pointer',
