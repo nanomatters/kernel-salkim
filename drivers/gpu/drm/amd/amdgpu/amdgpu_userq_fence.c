@@ -553,18 +553,31 @@ int amdgpu_userq_signal_ioctl(struct drm_device *dev, void *data,
 	if (r)
 		goto put_queue;
 
-	r = amdgpu_userq_fence_alloc(queue, &fence);
-	if (r)
-		goto put_queue;
-
-	/* We are here means UQ is active, make sure the eviction fence is valid */
+	/* Keep queue cancellation and fence creation serialized. */
 	amdgpu_userq_ensure_ev_fence(&fpriv->userq_mgr, &fpriv->evf_mgr);
+	mutex_lock(&queue->state_mutex);
+	if (queue->state == AMDGPU_USERQ_STATE_HUNG ||
+	    queue->state == AMDGPU_USERQ_STATE_INVALID_VA ||
+	    queue->state == AMDGPU_USERQ_STATE_CANCELED) {
+		mutex_unlock(&queue->state_mutex);
+		mutex_unlock(&userq_mgr->userq_mutex);
+		r = -ECANCELED;
+		goto put_queue;
+	}
+
+	r = amdgpu_userq_fence_alloc(queue, &fence);
+	if (r) {
+		mutex_unlock(&queue->state_mutex);
+		mutex_unlock(&userq_mgr->userq_mutex);
+		goto put_queue;
+	}
 
 	/* Create the new fence */
 	amdgpu_userq_fence_init(queue, fence, wptr);
 
 	trace_amdgpu_userq_emit_fence(dev->dev, queue, fence);
 
+	mutex_unlock(&queue->state_mutex);
 	mutex_unlock(&userq_mgr->userq_mutex);
 
 	/*

@@ -38,6 +38,7 @@ enum amdgpu_userq_state {
 	AMDGPU_USERQ_STATE_PREEMPTED,
 	AMDGPU_USERQ_STATE_HUNG,
 	AMDGPU_USERQ_STATE_INVALID_VA,
+	AMDGPU_USERQ_STATE_CANCELED,
 };
 
 struct amdgpu_mqd_prop;
@@ -51,6 +52,8 @@ struct amdgpu_userq_obj {
 struct amdgpu_usermode_queue {
 	int			queue_type;
 	enum amdgpu_userq_state state;
+	/* Serializes state changes and fence publication. */
+	struct mutex		state_mutex;
 	uint64_t		doorbell_handle;
 	uint64_t		doorbell_index;
 	u32			doorbell_offset;
