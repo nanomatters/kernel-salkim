@@ -153,7 +153,8 @@ static void check(int signal, bool pcon, bool hf, unsigned minimum, unsigned max
     amdgpu_dm_update_freesync_caps(&c.base, &edid, do_mccs);
     assert(state.freesync_capable == supported);
     assert(state.freesync_on_desktop_capable == supported);
-    bool selected_hf = hf && minimum && (pcon || !amd);
+    bool selected_hf = hf && minimum &&
+        (pcon || !amd || (signal == SIGNAL_TYPE_HDMI_TYPE_A && !vcp));
     if (selected_hf && supported) {
         assert(c.min_vfreq == (int)minimum && c.max_vfreq == (int)maximum);
         assert(c.vrr_max_from_mode == !maximum);
@@ -164,6 +165,11 @@ static void check(int signal, bool pcon, bool hf, unsigned minimum, unsigned max
             assert(c.base.display_info.monitor_range.max_vfreq == 120);
         }
     }
+    if (!pcon && amd && vcp && supported) {
+        assert(c.min_vfreq == 48 && c.max_vfreq == 144);
+        assert(!c.vrr_max_from_mode && c.vsdb_info.amd_vsdb_version);
+        assert(mccs_reads == do_mccs && mccs_writes == do_mccs);
+    }
     if (pcon && supported)
         assert(c.pack_sdp_v1_3);
     amdgpu_dm_update_freesync_caps(&c.base, NULL, do_mccs);
@@ -173,6 +179,10 @@ static void check(int signal, bool pcon, bool hf, unsigned minimum, unsigned max
 int main(void)
 {
     for (unsigned mccs = 0; mccs < 2; mccs++) {
+        check(SIGNAL_TYPE_HDMI_TYPE_A, false, true, 48, 120, true, false, mccs, true);
+        check(SIGNAL_TYPE_HDMI_TYPE_A, false, true, 48, 0, true, false, mccs, true);
+        check(SIGNAL_TYPE_HDMI_TYPE_A, false, true, 48, 55, true, false, mccs, false);
+        check(SIGNAL_TYPE_HDMI_TYPE_A, false, true, 48, 120, true, true, mccs, true);
         check(SIGNAL_TYPE_HDMI_TYPE_A, false, true, 48, 120, false, false, mccs, true);
         check(SIGNAL_TYPE_HDMI_FRL, false, true, 48, 0, false, false, mccs, true);
         check(SIGNAL_TYPE_DISPLAY_PORT, true, true, 48, 120, false, false, mccs, true);
