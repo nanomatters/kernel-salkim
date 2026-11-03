@@ -69,10 +69,10 @@ static int amdgpu_vm_batch_status(struct amdgpu_vm *vm)
 { assert(vm); status_calls++; return vm->opted_in ? vm->status : 0; }
 static void dma_fence_set_error(struct dma_fence *fence, int error)
 { assert(error < 0); error_sets++; fence->error = error; }
-static int amdgpu_ib_schedule(struct amdgpu_ring *ring, unsigned count, void *ibs,
-                              struct amdgpu_job *job, struct dma_fence **fence)
+static int amdgpu_ib_schedule(struct amdgpu_ring *ring, struct amdgpu_job *job,
+                              struct dma_fence **fence)
 {
-    assert(ring == job->base.sched->ring && count == job->num_ibs && ibs == job->ibs);
+    assert(ring == job->base.sched->ring && job->num_ibs == 2 && job->ibs);
     assert(!job->base.s_fence->finished.error);
     assert(!job->vm || !job->vm->opted_in || job->vm->status >= 0);
     schedules++;
