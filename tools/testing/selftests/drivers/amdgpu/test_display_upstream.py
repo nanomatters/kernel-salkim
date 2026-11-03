@@ -28,10 +28,10 @@ DISPLAY = find_display()
 class DisplayUpstreamTests(unittest.TestCase):
     def function(self, file, name):
         source = (DISPLAY / file).read_text()
-        match = re.search(r'^(?:static )?(?:bool|void|int|uint32_t) ' + name +
+        match = re.search(r'^(?:(?:static|STATIC_IFN_KUNIT) )?(?:bool|void|int|uint32_t) ' + name +
                           r'\(.*?^\}', source, re.M | re.S)
         self.assertIsNotNone(match, name)
-        return match.group()
+        return match.group().replace('STATIC_IFN_KUNIT ', 'static ')
 
     def run_program(self, source):
         with tempfile.TemporaryDirectory() as temporary:
