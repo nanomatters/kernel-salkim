@@ -1208,6 +1208,12 @@ int amdgpu_gem_va_batch_ioctl(struct drm_device *dev, void *data,
 	r = amdgpu_vm_batch_status(vm);
 	if (r)
 		return r;
+	PM_RUNTIME_ACQUIRE_IF_ENABLED_AUTOSUSPEND(dev->dev, pm_lock);
+
+	r = PM_RUNTIME_ACQUIRE_ERR(&pm_lock);
+	if (r)
+		return r;
+
 	ops = vmemdup_user(u64_to_user_ptr(args->operations),
 			  array_size(args->count, sizeof(*ops)));
 	if (IS_ERR(ops))
