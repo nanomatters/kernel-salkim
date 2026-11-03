@@ -3842,6 +3842,11 @@ void amdgpu_dm_update_freesync_caps(struct drm_connector *connector,
 		}
 	}
 
+	/* Validate AMD FreeSync before considering the HDMI Forum fallback. */
+	if (sink->sink_signal == SIGNAL_TYPE_HDMI_TYPE_A &&
+	    !sink->edid_caps.freesync_vcp_code)
+		freesync_capable = false;
+
 	drm_dbg_driver(adev_to_drm(adev),
 		       "VRR: amd_vsdb fs_sup=%d min=%d max=%d fs_capable=%d\n",
 		       vsdb_info.freesync_supported,
@@ -3919,9 +3924,8 @@ void amdgpu_dm_update_freesync_caps(struct drm_connector *connector,
 			amdgpu_dm_connector->min_vfreq;
 	}
 
-	/* HDMI/PCON without an EDID FreeSync VCP code is not FreeSync-capable. */
-	if ((sink->sink_signal == SIGNAL_TYPE_HDMI_TYPE_A ||
-	     as_type == FREESYNC_TYPE_PCON_IN_WHITELIST) &&
+	/* AMD FreeSync over PCON requires an EDID FreeSync VCP code. */
+	if (as_type == FREESYNC_TYPE_PCON_IN_WHITELIST &&
 	    !hdmi_vrr_selected && !sink->edid_caps.freesync_vcp_code)
 		freesync_capable = false;
 
