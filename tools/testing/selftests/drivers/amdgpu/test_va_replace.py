@@ -67,6 +67,8 @@ typedef uint32_t u32;
 #define dev_dbg(...) ((void)0)
 #define DRM_ERROR(...) ((void)0)
 #define unlikely(x) (x)
+#define PM_RUNTIME_ACQUIRE_IF_ENABLED_AUTOSUSPEND(dev, name) int name = 0
+#define PM_RUNTIME_ACQUIRE_ERR(lock) (*(lock))
 struct dma_fence { unsigned mask, waits, refs; };
 struct drm_gem_object { unsigned id, refs; bool locked; };
 struct amdgpu_bo { struct { struct drm_gem_object base; } tbo; bool always_valid; };
