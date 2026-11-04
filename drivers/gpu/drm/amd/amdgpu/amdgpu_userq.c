@@ -1395,7 +1395,8 @@ retry_lock:
 			goto unlock_all;
 		}
 
-		queue->wptr_obj.gpu_addr = amdgpu_bo_gpu_offset(bo);
+		queue->wptr_obj.gpu_addr = amdgpu_bo_gpu_offset(bo) +
+					    queue->wptr_bo_offset;
 	}
 
 	ret = amdgpu_evf_mgr_rearm(&fpriv->evf_mgr, &exec);
