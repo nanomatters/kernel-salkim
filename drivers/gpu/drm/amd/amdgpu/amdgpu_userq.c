@@ -863,7 +863,10 @@ amdgpu_userq_create(struct drm_file *filp, union drm_amdgpu_userq *args)
 		amdgpu_bo_unreserve(fpriv->vm.root.bo);
 		goto free_fence_drv;
 	}
+	r = amdgpu_vm_enable_tlb_fences(adev, &fpriv->vm);
 	amdgpu_bo_unreserve(fpriv->vm.root.bo);
+	if (r)
+		goto free_fence_drv;
 
 	/* Convert relative doorbell offset into absolute doorbell index */
 	db_info.queue_type = queue->queue_type;
