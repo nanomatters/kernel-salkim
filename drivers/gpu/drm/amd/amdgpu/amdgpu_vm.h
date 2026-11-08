@@ -408,6 +408,8 @@ struct amdgpu_vm {
 	/* contains the page directory */
 	struct amdgpu_vm_bo_base     root;
 	struct dma_fence	*last_update;
+	/* Explicit native binds, kept separate from maintenance dependencies. */
+	struct dma_fence	*last_bind;
 	struct amdgpu_vm_batch_state *batch_state;
 
 	/* Scheduler entities for page table updates */
@@ -563,6 +565,7 @@ int amdgpu_vm_update_range(struct amdgpu_device *adev, struct amdgpu_vm *vm,
 int amdgpu_vm_bo_update(struct amdgpu_device *adev,
 			struct amdgpu_bo_va *bo_va,
 			bool clear);
+bool amdgpu_vm_range_is_private(struct amdgpu_vm *vm, u64 start, u64 last);
 bool amdgpu_vm_skip_prt_clears(struct amdgpu_device *adev,
 		struct amdgpu_vm *vm, struct xarray *bos, struct list_head *freed);
 int amdgpu_vm_bo_update_batch(struct amdgpu_device *adev, struct amdgpu_vm *vm,

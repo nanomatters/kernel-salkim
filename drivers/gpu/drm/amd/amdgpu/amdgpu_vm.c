@@ -1581,6 +1581,28 @@ static bool amdgpu_vm_bo_can_batch(struct amdgpu_vm *vm,
 		(bo_va->base.moved || bo_va->cleared || !list_empty(&bo_va->invalids));
 }
 
+/* Explicit native binds can retire only mappings protected by the root. */
+bool amdgpu_vm_range_is_private(struct amdgpu_vm *vm, u64 start, u64 last)
+{
+	struct amdgpu_bo_va_mapping *mapping;
+
+	amdgpu_vm_assert_locked(vm);
+	for (mapping = amdgpu_vm_it_iter_first(&vm->va, start, last); mapping;
+	     mapping = amdgpu_vm_it_iter_next(mapping, start, last)) {
+		struct amdgpu_bo *bo = mapping->bo_va->base.bo;
+
+		if (!bo) {
+			if (!(mapping->flags & AMDGPU_VM_PAGE_PRT))
+				return false;
+		} else if (!amdgpu_vm_is_bo_always_valid(vm, bo) ||
+			   drm_gem_is_imported(&bo->tbo.base) ||
+			   amdgpu_ttm_tt_get_usermm(bo->tbo.ttm)) {
+			return false;
+		}
+	}
+	return true;
+}
+
 /* Only accepted timeline batches may discard these records: update failures
  * stop that VM rather than retrying clears over already submitted mappings.
  * Every record is covered by a REPLACE in this batch. PRT has no backing BO,
@@ -3066,6 +3088,7 @@ int amdgpu_vm_init(struct amdgpu_device *adev, struct amdgpu_vm *vm,
 		vm->update_funcs = &amdgpu_vm_sdma_funcs;
 
 	vm->last_update = dma_fence_get_stub();
+	vm->last_bind = dma_fence_get_stub();
 	vm->last_unlocked = dma_fence_get_stub();
 	vm->last_seq_flush = dma_fence_get_stub();
 	vm->last_tlb_inv = dma_fence_get_stub();
@@ -3112,6 +3135,7 @@ error_free_root:
 
 error_free_delayed:
 	dma_fence_put(vm->last_update);
+	dma_fence_put(vm->last_bind);
 	dma_fence_put(vm->last_seq_flush);
 	dma_fence_put(vm->last_tlb_inv);
 	dma_fence_put(vm->last_unlocked);
@@ -3143,6 +3167,12 @@ int amdgpu_vm_enable_tlb_fences(struct amdgpu_device *adev, struct amdgpu_vm *vm
 		return 0;
 
 	amdgpu_vm_eviction_lock(vm);
+	r = dma_fence_wait(vm->last_bind, true);
+	if (r)
+		goto unlock;
+	r = amdgpu_vm_batch_status(vm);
+	if (r)
+		goto unlock;
 	r = dma_fence_wait(vm->last_unlocked, true);
 	if (r)
 		goto unlock;
@@ -3194,6 +3224,13 @@ int amdgpu_vm_make_compute(struct amdgpu_device *adev, struct amdgpu_vm *vm)
 	r = amdgpu_bo_reserve(vm->root.bo, true);
 	if (r)
 		return r;
+
+	r = dma_fence_wait(vm->last_bind, false);
+	if (r)
+		goto unreserve_bo;
+	r = amdgpu_vm_batch_status(vm);
+	if (r)
+		goto unreserve_bo;
 
 	/* Update VM state */
 	vm->use_cpu_for_update = !!(adev->vm_manager.vm_update_mode &
@@ -3259,6 +3296,7 @@ void amdgpu_vm_fini(struct amdgpu_device *adev, struct amdgpu_vm *vm)
 
 	root = amdgpu_bo_ref(vm->root.bo);
 	amdgpu_bo_reserve(root, true);
+	dma_fence_wait(vm->last_bind, false);
 	dma_fence_wait(vm->last_unlocked, false);
 	dma_fence_put(vm->last_unlocked);
 	dma_fence_wait(vm->last_seq_flush, false);
@@ -3297,6 +3335,7 @@ void amdgpu_vm_fini(struct amdgpu_device *adev, struct amdgpu_vm *vm)
 	}
 
 	dma_fence_put(vm->last_update);
+	dma_fence_put(vm->last_bind);
 	dma_fence_put(vm->last_tlb_inv);
 
 	for (i = 0; i < AMDGPU_MAX_VMHUBS; i++) {

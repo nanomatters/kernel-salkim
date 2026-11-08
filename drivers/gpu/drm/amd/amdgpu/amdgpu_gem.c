@@ -1117,6 +1117,113 @@ bool amdgpu_gem_va_batch_supported(struct amdgpu_device *adev,
 			      !amdgpu_userq_enabled(adev_to_drm(adev))));
 }
 
+bool amdgpu_gem_va_batch_no_cs_wait_supported(struct amdgpu_device *adev,
+					     struct amdgpu_vm *vm)
+{
+	return amdgpu_gem_va_batch_supported(adev, vm, true) &&
+		!READ_ONCE(vm->need_tlb_fence);
+}
+
+/* The published fence must signal after a post-update TLB sequence increment.
+ * Waiting on an SDMA fence alone can race its existing sequence callback.
+ */
+struct amdgpu_va_batch_completion {
+	struct dma_fence base;
+	spinlock_t lock;
+	struct dma_fence_cb cb;
+	struct dma_fence_array *updates;
+	struct amdgpu_vm *vm;
+};
+
+static const char *amdgpu_va_batch_completion_driver(struct dma_fence *f)
+{
+	return "amdgpu";
+}
+
+static const char *amdgpu_va_batch_completion_timeline(struct dma_fence *f)
+{
+	return "VM bind";
+}
+
+static void amdgpu_va_batch_completion_release(struct dma_fence *f)
+{
+	struct amdgpu_va_batch_completion *done =
+		container_of(f, typeof(*done), base);
+
+	if (done->updates)
+		dma_fence_put(&done->updates->base);
+	dma_fence_free(f);
+}
+
+static const struct dma_fence_ops amdgpu_va_batch_completion_ops = {
+	.get_driver_name = amdgpu_va_batch_completion_driver,
+	.get_timeline_name = amdgpu_va_batch_completion_timeline,
+	.release = amdgpu_va_batch_completion_release,
+};
+
+static void amdgpu_va_batch_completion_cb(struct dma_fence *f,
+					struct dma_fence_cb *cb)
+{
+	struct amdgpu_va_batch_completion *done =
+		container_of(cb, typeof(*done), cb);
+	unsigned int i;
+
+	/* Inspect every child: a completed array can conceal child errors. */
+	for (i = 0; i < done->updates->num_fences; i++) {
+		int status = dma_fence_get_status(done->updates->fences[i]);
+
+		if (status < 0) {
+			dma_fence_set_error(&done->base, status);
+			break;
+		}
+	}
+	atomic64_inc(&done->vm->tlb_seq);
+	/* Drop completed ancestry instead of retaining every older bind. */
+	done->updates = NULL;
+	dma_fence_put(f);
+	dma_fence_signal(&done->base);
+	dma_fence_put(&done->base);
+}
+
+static struct amdgpu_va_batch_completion *
+amdgpu_va_batch_completion_alloc(struct amdgpu_vm *vm)
+{
+	struct amdgpu_va_batch_completion *done;
+
+	done = kzalloc_obj(*done);
+	if (!done)
+		return NULL;
+	spin_lock_init(&done->lock);
+	dma_fence_init(&done->base, &amdgpu_va_batch_completion_ops,
+		       &done->lock, dma_fence_context_alloc(1), 1);
+	set_bit(DRM_SCHED_FENCE_DONT_PIPELINE, &done->base.flags);
+	done->vm = vm;
+	return done;
+}
+
+/* Takes ownership of the update array reference. */
+static struct dma_fence *
+amdgpu_va_batch_completion_arm(struct amdgpu_va_batch_completion *done,
+			      struct dma_fence *updates)
+{
+	done->updates = to_dma_fence_array(updates);
+	dma_fence_get(&done->base);
+	if (dma_fence_add_callback(updates, &done->cb,
+				   amdgpu_va_batch_completion_cb))
+		amdgpu_va_batch_completion_cb(updates, &done->cb);
+	return &done->base;
+}
+
+static bool amdgpu_va_batch_private_bo(struct amdgpu_vm *vm,
+				     struct amdgpu_bo_va *bo_va)
+{
+	struct amdgpu_bo *bo = bo_va->base.bo;
+
+	return !bo || (amdgpu_vm_is_bo_always_valid(vm, bo) &&
+		       !drm_gem_is_imported(&bo->tbo.base) &&
+		       !amdgpu_ttm_tt_get_usermm(bo->tbo.ttm));
+}
+
 struct amdgpu_va_batch_entry {
 	struct drm_gem_object *obj;
 	struct amdgpu_bo_va *bo_va;
@@ -1126,7 +1233,8 @@ struct amdgpu_va_batch_entry {
 /* Storage is reserved before any mappings change. Do not discard error fences. */
 static struct dma_fence *
 amdgpu_gem_va_batch_fence(struct amdgpu_vm *vm, struct xarray *bos,
-			  struct dma_fence_array *array, struct dma_fence **fences)
+			  struct dma_fence_array *array, struct dma_fence **fences,
+			  bool no_cs_wait)
 {
 	struct amdgpu_bo_va *bo_va;
 	unsigned long index;
@@ -1134,6 +1242,9 @@ amdgpu_gem_va_batch_fence(struct amdgpu_vm *vm, struct xarray *bos,
 
 	fences[count++] = dma_fence_get(vm->last_update);
 	fences[count++] = dma_fence_get(vm->last_tlb_inv);
+	/* Chain completion callbacks so last_bind also protects older VM references. */
+	if (no_cs_wait)
+		fences[count++] = dma_fence_get(vm->last_bind);
 	xa_for_each(bos, index, bo_va)
 		if (bo_va->last_pt_update)
 			fences[count++] = dma_fence_get(bo_va->last_pt_update);
@@ -1160,11 +1271,14 @@ int amdgpu_gem_va_batch_ioctl(struct drm_device *dev, void *data,
 	struct dma_fence **fences = NULL;
 	struct dma_fence *previous_tlb = NULL;
 	struct amdgpu_vm_batch_entry *batch_entry = NULL;
+	struct amdgpu_va_batch_completion *completion = NULL;
+	struct dma_fence *maintenance = NULL, *prt_maintenance = NULL;
 	struct drm_exec exec;
 	DEFINE_XARRAY(bos);
 	LIST_HEAD(freed);
 	bool explicit_sync = args->flags & AMDGPU_GEM_VA_BATCH_WAIT_COMPLETE;
 	bool timeline = args->flags & AMDGPU_GEM_VA_BATCH_VM_TIMELINE;
+	bool no_cs_wait = args->flags & AMDGPU_GEM_VA_BATCH_NO_CS_WAIT;
 	bool accepted = false;
 	bool flush_tlb = false;
 	u64 tlb_seq = 0;
@@ -1175,9 +1289,14 @@ int amdgpu_gem_va_batch_ioctl(struct drm_device *dev, void *data,
 	int r;
 
 	if ((args->flags & ~(AMDGPU_GEM_VA_BATCH_WAIT_COMPLETE |
-			     AMDGPU_GEM_VA_BATCH_VM_TIMELINE)) ||
+			     AMDGPU_GEM_VA_BATCH_VM_TIMELINE |
+			     AMDGPU_GEM_VA_BATCH_NO_CS_WAIT)) ||
 	    !args->count || args->count > AMDGPU_GEM_VA_BATCH_MAX_OPS)
 		return -EINVAL;
+	if (no_cs_wait && (!timeline || !explicit_sync))
+		return -EINVAL;
+	if (no_cs_wait && !amdgpu_gem_va_batch_no_cs_wait_supported(adev, vm))
+		return -EOPNOTSUPP;
 	if (timeline) {
 		if (!args->vm_timeline_syncobj_out || !args->vm_timeline_point || args->pad)
 			return -EINVAL;
@@ -1281,6 +1400,10 @@ int amdgpu_gem_va_batch_ioctl(struct drm_device *dev, void *data,
 		r = -EOPNOTSUPP;
 		goto unlock;
 	}
+	if (no_cs_wait && !amdgpu_gem_va_batch_no_cs_wait_supported(adev, vm)) {
+		r = -EOPNOTSUPP;
+		goto unlock;
+	}
 	/* User queues cannot delegate an accepted update to a later CS. */
 	if (timeline && !amdgpu_vm_ready(vm)) {
 		r = -EBUSY;
@@ -1292,6 +1415,10 @@ int amdgpu_gem_va_batch_ioctl(struct drm_device *dev, void *data,
 			fpriv->prt_va;
 		if (!bo_va) {
 			r = -ENOENT;
+			goto unlock;
+		}
+		if (no_cs_wait && !amdgpu_va_batch_private_bo(vm, bo_va)) {
+			r = -EOPNOTSUPP;
 			goto unlock;
 		}
 		entries[i].bo_va = bo_va;
@@ -1323,12 +1450,40 @@ int amdgpu_gem_va_batch_ioctl(struct drm_device *dev, void *data,
 		}
 	}
 
+	if (no_cs_wait) {
+		/* Do not hide pre-existing maintenance in the explicit bind fence. */
+		if (!list_empty(&vm->kernel.needs_update)) {
+			r = -EOPNOTSUPP;
+			goto unlock;
+		}
+		xa_for_each(&bos, index, bo_va) {
+			if (bo_va->base.moved || bo_va->cleared ||
+			    !list_empty(&bo_va->invalids)) {
+				r = -EOPNOTSUPP;
+				goto unlock;
+			}
+		}
+		for (i = 0; i < args->count; i++) {
+			u64 start = ops[i].va_address / AMDGPU_GPU_PAGE_SIZE;
+			u64 last = start + ops[i].map_size / AMDGPU_GPU_PAGE_SIZE - 1;
+
+			if (!amdgpu_vm_range_is_private(vm, start, last)) {
+				r = -EOPNOTSUPP;
+				goto unlock;
+			}
+		}
+		completion = amdgpu_va_batch_completion_alloc(vm);
+		if (!completion) {
+			r = -ENOMEM;
+			goto unlock;
+		}
+	}
 	if (timeline) {
 		/* Size completion storage for the actual distinct BO set. */
 		xa_for_each(&bos, index, bo_va)
 			++num_bos;
-		array = dma_fence_array_alloc(num_bos + 2);
-		fences = kmalloc_array(num_bos + 2, sizeof(*fences), GFP_KERNEL);
+		array = dma_fence_array_alloc(num_bos + 2 + no_cs_wait);
+		fences = kmalloc_array(num_bos + 2 + no_cs_wait, sizeof(*fences), GFP_KERNEL);
 		batch_entry = kzalloc_obj(*batch_entry);
 		if (!array || !fences || !batch_entry) {
 			r = -ENOMEM;
@@ -1364,6 +1519,10 @@ int amdgpu_gem_va_batch_ioctl(struct drm_device *dev, void *data,
 
 	/* Reuse existing batching, reservation dependencies and invalidation. */
 	r = amdgpu_vm_clear_freed(adev, vm, &vm->last_update);
+	if (!r && no_cs_wait) {
+		maintenance = dma_fence_get(vm->last_update);
+		prt_maintenance = dma_fence_get(fpriv->prt_va->last_pt_update);
+	}
 	if (!r && explicit_sync)
 		r = amdgpu_vm_clear_freed_list(adev, vm, &freed,
 					       AMDGPU_SYNC_EXPLICIT, &vm->last_update);
@@ -1379,7 +1538,7 @@ int amdgpu_gem_va_batch_ioctl(struct drm_device *dev, void *data,
 			r = -EIO;
 			goto unlock;
 		}
-		fence = amdgpu_gem_va_batch_fence(vm, &bos, array, fences);
+		fence = amdgpu_gem_va_batch_fence(vm, &bos, array, fences, no_cs_wait);
 		array = NULL;
 		fences = NULL;
 		if (vm->need_tlb_fence &&
@@ -1395,6 +1554,21 @@ int amdgpu_gem_va_batch_ioctl(struct drm_device *dev, void *data,
 			dma_resv_add_fence(vm->root.bo->tbo.base.resv,
 					   vm->last_tlb_inv, DMA_RESV_USAGE_BOOKKEEP);
 			fence = dma_fence_get(vm->last_tlb_inv);
+		}
+		if (no_cs_wait) {
+			fence = amdgpu_va_batch_completion_arm(completion, fence);
+			completion = NULL;
+			dma_fence_put(vm->last_bind);
+			vm->last_bind = dma_fence_get(fence);
+			dma_resv_add_fence(vm->root.bo->tbo.base.resv, fence,
+					   DMA_RESV_USAGE_BOOKKEEP);
+			/* Future maintenance stays implicit; only this explicit bind is separate. */
+			dma_fence_put(vm->last_update);
+			vm->last_update = maintenance;
+			maintenance = NULL;
+			dma_fence_put(fpriv->prt_va->last_pt_update);
+			fpriv->prt_va->last_pt_update = prt_maintenance;
+			prt_maintenance = NULL;
 		}
 		amdgpu_vm_batch_track(vm, batch_entry, fence);
 		batch_entry = NULL;
@@ -1423,6 +1597,10 @@ unlock:
 	list_splice_init(&freed, &vm->freed);
 	drm_exec_fini(&exec);
 out:
+	dma_fence_put(maintenance);
+	dma_fence_put(prt_maintenance);
+	if (completion)
+		dma_fence_put(&completion->base);
 	dma_fence_put(previous_tlb);
 	kfree(batch_entry);
 	kfree(array);
