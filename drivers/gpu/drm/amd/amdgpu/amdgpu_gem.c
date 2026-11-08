@@ -1166,6 +1166,7 @@ int amdgpu_gem_va_batch_ioctl(struct drm_device *dev, void *data,
 	bool explicit_sync = args->flags & AMDGPU_GEM_VA_BATCH_WAIT_COMPLETE;
 	bool timeline = args->flags & AMDGPU_GEM_VA_BATCH_VM_TIMELINE;
 	bool accepted = false;
+	bool flush_tlb = false;
 	u64 tlb_seq = 0;
 	unsigned int num_bos = 0;
 	unsigned long index;
@@ -1356,13 +1357,18 @@ int amdgpu_gem_va_batch_ioctl(struct drm_device *dev, void *data,
 		goto unlock;
 	}
 
+	if (timeline && explicit_sync &&
+	    amdgpu_vm_skip_prt_clears(adev, vm, &bos, &freed))
+		/* A remaining clear batch already updates the TLB sequence. */
+		flush_tlb = list_empty(&freed) && list_empty(&vm->freed);
+
 	/* Reuse existing batching, reservation dependencies and invalidation. */
 	r = amdgpu_vm_clear_freed(adev, vm, &vm->last_update);
 	if (!r && explicit_sync)
 		r = amdgpu_vm_clear_freed_list(adev, vm, &freed,
 					       AMDGPU_SYNC_EXPLICIT, &vm->last_update);
 	if (!r)
-		r = amdgpu_vm_bo_update_batch(adev, vm, &bos);
+		r = amdgpu_vm_bo_update_batch(adev, vm, &bos, flush_tlb);
 	if (!r)
 		r = amdgpu_vm_update_pdes(adev, vm, false);
 	if (timeline) {
