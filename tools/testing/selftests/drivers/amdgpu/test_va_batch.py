@@ -44,7 +44,9 @@ class VaBatchTests(unittest.TestCase):
         final = re.search(r'^static void amdgpu_vm_batch_fini\(.*?^\}', vm[begin:], re.M | re.S)
         self.assertIsNotNone(final)
         state = entry.group() + '\n' + vm[begin:begin + final.end()]
-        functions = state + '\n' + timeline.group() + '\n' + boundary.group() + '\n' + body
+        private = re.search(r'^bool amdgpu_vm_range_is_private\(.*?^\}', vm, re.M | re.S)
+        self.assertIsNotNone(private)
+        functions = private.group() + '\n' + state + '\n' + timeline.group() + '\n' + boundary.group() + '\n' + body
         private_uapi = (AMD / 'amdgpu_salkim.c').read_text()
         caps = re.search(r'^static void amdgpu_salkim_get_caps\(.*?^\}',
                          private_uapi, re.M | re.S)
@@ -129,6 +131,9 @@ typedef uint64_t u64;
 #define smp_load_acquire(p) __atomic_load_n(p, __ATOMIC_ACQUIRE)
 #define smp_store_release(p, value) __atomic_store_n(p, value, __ATOMIC_RELEASE)
 #define atomic64_read(p) (*(p))
+#define atomic64_inc(p) (++*(p))
+#define DRM_SCHED_FENCE_DONT_PIPELINE 0
+#define set_bit(bit, flags) (*(flags) |= 1ul << (bit))
 #define container_of(p, t, member) ((t *)((char *)(p) - offsetof(t, member)))
 #define INIT_LIST_HEAD(head) ((head)->next = (head)->prev = (head))
 #define list_for_each_entry_safe(entry, tmp, head, member) \
@@ -137,30 +142,45 @@ typedef uint64_t u64;
          (entry = container_of(node, typeof(*entry), member)), \
          (tmp = next != (head) ? container_of(next, typeof(*tmp), member) : NULL), true); node = next)
 #define dma_resv_assert_held(resv) assert(locked)
+#define amdgpu_vm_assert_locked(vm) assert(locked)
 #define min_t(t, a, b) ((t)(a) < (t)(b) ? (t)(a) : (t)(b))
 #define min(a, b) ((a) < (b) ? (a) : (b))
 #define dev_dbg_ratelimited(...) ((void)0)
 #define drm_exec_until_all_locked(e) for (bool once = true; once; once = false)
 #define drm_exec_retry_on_contention(e) ((void)0)
 
-struct dma_fence { _Atomic unsigned refs; unsigned kind; bool signaled; int error; struct dma_fence *dependency; };
+struct dma_fence;
+struct dma_fence_ops {
+    const char *(*get_driver_name)(struct dma_fence *);
+    const char *(*get_timeline_name)(struct dma_fence *);
+    void (*release)(struct dma_fence *);
+};
+struct dma_fence { _Atomic unsigned refs; unsigned kind; bool signaled; int error; struct dma_fence *dependency;
+                   const struct dma_fence_ops *ops; unsigned long flags; };
+struct dma_fence_cb { struct dma_fence_cb *next; struct dma_fence *fence;
+                      void (*fn)(struct dma_fence *, struct dma_fence_cb *); };
+typedef unsigned spinlock_t;
+#define spin_lock_init(lock) (*(lock) = 0)
+static struct dma_fence_cb *pending_callbacks;
 struct dma_fence_array { struct dma_fence base; unsigned num_fences, capacity; struct dma_fence **fences; };
 struct dma_fence_chain { unsigned unused; };
 struct dma_resv { struct dma_fence *fence; };
 struct ttm_resource { unsigned mem_type; };
 struct amdgpu_bo_va;
-struct drm_gem_object { struct dma_resv *resv; struct amdgpu_bo_va *mapping; _Atomic unsigned refs; unsigned handle; };
-struct amdgpu_bo { struct { struct drm_gem_object base; struct ttm_resource *resource; } tbo; bool always_valid; };
-struct amdgpu_bo_va { struct { struct amdgpu_bo *bo; } base; struct dma_fence *last_pt_update; };
-struct amdgpu_bo_va_mapping { u64 start, last; struct amdgpu_bo_va *bo_va; };
+struct drm_gem_object { bool imported; struct dma_resv *resv; struct amdgpu_bo_va *mapping; _Atomic unsigned refs; unsigned handle; };
+struct amdgpu_bo { struct { struct drm_gem_object base; struct ttm_resource *resource; void *ttm; } tbo; bool always_valid; };
 struct list_head { unsigned count; struct list_head *next, *prev; };
+struct amdgpu_bo_va { struct { struct amdgpu_bo *bo; bool moved; } base;
+                     bool cleared; struct list_head invalids; struct dma_fence *last_pt_update; };
+struct amdgpu_bo_va_mapping { u64 start, last; struct amdgpu_bo_va *bo_va; u32 flags; };
 static bool list_empty(const struct list_head *list) { return list->count == 0; }
 struct mutex { pthread_mutex_t value; };
 struct amdgpu_vm_batch_state;
 struct amdgpu_vm {
     bool use_cpu_for_update, is_compute_context, need_tlb_fence, ready;
     struct { struct amdgpu_bo *bo; } root;
-    struct dma_fence *last_update, *last_tlb_inv;
+    struct dma_fence *last_update, *last_tlb_inv, *last_bind;
+    unsigned va; struct { struct list_head needs_update; } kernel;
     struct list_head freed;
     struct amdgpu_vm_batch_state *batch_state;
     u64 tlb_seq;
@@ -259,6 +279,22 @@ static struct amdgpu_bo_va_mapping *amdgpu_vm_bo_lookup_mapping(struct amdgpu_vm
             return &old_mappings[i];
     return NULL;
 }
+static struct amdgpu_bo_va_mapping *amdgpu_vm_it_iter_first(unsigned *tree, u64 start, u64 last)
+{
+    for (unsigned i = 0; i < ARRAY_SIZE(old_mappings); i++)
+        if (old_mappings[i].bo_va && old_mappings[i].start <= last && old_mappings[i].last >= start)
+            return &old_mappings[i];
+    return NULL;
+}
+static struct amdgpu_bo_va_mapping *amdgpu_vm_it_iter_next(struct amdgpu_bo_va_mapping *old, u64 start, u64 last)
+{
+    for (unsigned i = old - old_mappings + 1; i < ARRAY_SIZE(old_mappings); i++)
+        if (old_mappings[i].bo_va && old_mappings[i].start <= last && old_mappings[i].last >= start)
+            return &old_mappings[i];
+    return NULL;
+}
+static bool drm_gem_is_imported(struct drm_gem_object *obj) { return obj->imported; }
+static void *amdgpu_ttm_tt_get_usermm(void *ttm) { return ttm; }
 static int amdgpu_vm_verify_parameters(struct amdgpu_device *adev, struct amdgpu_bo *bo,
                                       u64 addr, u64 offset, u64 size)
 { return !size || ((addr | offset | size) & 4095) ? -EINVAL : 0; }
@@ -303,6 +339,7 @@ static void dma_fence_put(struct dma_fence *f)
     if (!f) return;
     assert(f->refs);
     if (--f->refs) return;
+    if (f->ops && f->ops->release) { f->ops->release(f); return; }
     if (f->kind == 1) {
         struct dma_fence_array *a = (void *)f;
         for (unsigned i = 0; i < a->num_fences; i++) dma_fence_put(a->fences[i]);
@@ -324,6 +361,33 @@ static bool dma_fence_is_signaled(struct dma_fence *f)
 }
 static int dma_fence_get_status(struct dma_fence *f)
 { return !dma_fence_is_signaled(f) ? 0 : f->error ? f->error : 1; }
+static struct dma_fence_array *to_dma_fence_array(struct dma_fence *f)
+{ return f->kind == 1 ? (void *)f : NULL; }
+static void dma_fence_free(struct dma_fence *f) { release(f); }
+static void dma_fence_init(struct dma_fence *f, const struct dma_fence_ops *ops,
+                           spinlock_t *lock, u64 context, u64 seq)
+{ f->refs = 1; f->kind = 3; f->ops = ops; }
+static void dma_fence_set_error(struct dma_fence *f, int error) { f->error = error; }
+static void dma_fence_signal(struct dma_fence *f) { f->signaled = true; }
+static int dma_fence_add_callback(struct dma_fence *f, struct dma_fence_cb *cb,
+                                  void (*fn)(struct dma_fence *, struct dma_fence_cb *))
+{
+    if (dma_fence_is_signaled(f)) return -ENOENT;
+    cb->fence = f; cb->fn = fn; cb->next = pending_callbacks; pending_callbacks = cb;
+    return 0;
+}
+static void pump_callbacks(void)
+{
+    bool progressed;
+    do {
+        progressed = false;
+        for (struct dma_fence_cb **next = &pending_callbacks; *next;) {
+            struct dma_fence_cb *cb = *next;
+            if (!dma_fence_is_signaled(cb->fence)) { next = &cb->next; continue; }
+            *next = cb->next; cb->fn(cb->fence, cb); progressed = true;
+        }
+    } while (progressed);
+}
 struct dma_fence_unwrap { unsigned i; };
 #define dma_fence_unwrap_for_each(f, it, root) \
     for ((it)->i = 0; \
@@ -436,6 +500,7 @@ static void setup(bool userq)
     root_bo.tbo.base.resv = &reservations[4];
     priv.vm.ready = true; priv.vm.need_tlb_fence = userq; priv.vm.root.bo = &root_bo;
     priv.vm.last_update = dma_fence_get(&leaves[4]);
+    priv.vm.last_bind = dma_fence_get(&leaves[0]);
     priv.vm.last_tlb_inv = dma_fence_get(&leaves[5]);
     prt.last_pt_update = dma_fence_get(&leaves[6]); priv.prt_va = &prt;
     first_syncobj.refs = syncobjs[1].refs = 1;
@@ -452,12 +517,12 @@ static void cleanup(void)
     for (unsigned i = 0; i < 2; i++) { dma_fence_put(syncobjs[i].fence); dma_fence_chain_free(syncobjs[i].chain); }
     for (unsigned i = 0; i < ARRAY_SIZE(reservations); i++) dma_fence_put(reservations[i].fence);
     amdgpu_vm_batch_fini(&priv.vm);
-    dma_fence_put(priv.vm.last_update); dma_fence_put(priv.vm.last_tlb_inv); dma_fence_put(prt.last_pt_update);
+    dma_fence_put(priv.vm.last_update); dma_fence_put(priv.vm.last_tlb_inv); dma_fence_put(priv.vm.last_bind); dma_fence_put(prt.last_pt_update);
     for (unsigned i = 0; i < ARRAY_SIZE(objects); i++) {
         assert(objects[i].tbo.base.refs == 1); dma_fence_put(mappings[i].last_pt_update);
     }
     for (unsigned i = 0; i < ARRAY_SIZE(leaves); i++) assert(leaves[i].refs == 1);
-    assert(!live_allocations); cases++;
+    assert(!live_allocations && !pending_callbacks); cases++;
 }
 static struct drm_amdgpu_gem_va_batch request(bool timeline)
 {
@@ -728,7 +793,7 @@ static void query_tests(void)
             assert(caps.batch_features == (AMDGPU_GEM_VA_BATCH_WAIT_COMPLETE |
                 AMDGPU_GEM_VA_BATCH_VM_TIMELINE | 0 |
                 0 |
-                0));
+                (!mapped_userq ? AMDGPU_GEM_VA_BATCH_NO_CS_WAIT : 0)));
         } else {
             assert(!caps.batch_features);
         }

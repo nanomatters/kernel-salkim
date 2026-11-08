@@ -69,6 +69,13 @@ struct drm_amdgpu_salkim_caps {
  */
 #define AMDGPU_GEM_VA_BATCH_VM_TIMELINE	(1U << 1)
 
+/* Native-queue batches may avoid implicit CS waits for their mapping updates.
+ * Requires WAIT_COMPLETE and VM_TIMELINE. Userspace must order use of the
+ * replaced ranges after the output point. Other GEM_VA updates stay implicit.
+ * Not available after the VM creates a user queue or becomes a KFD VM.
+ */
+#define AMDGPU_GEM_VA_BATCH_NO_CS_WAIT	(1U << 2)
+
 /* REPLACE operations, in array order. PRT with handle 0 unbinds a range.
  * DELAY_UPDATE is not accepted; the kernel manages pending updates.
  */
