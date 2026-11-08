@@ -125,6 +125,7 @@ typedef uint64_t u64;
 #define u64_to_user_ptr(v) ((void *)(uintptr_t)(v))
 #define array_size(a, b) ((size_t)(a) * (b))
 #define check_add_overflow(a, b, out) __builtin_add_overflow((a), (b), (out))
+#define READ_ONCE(p) __atomic_load_n(&(p), __ATOMIC_RELAXED)
 #define smp_load_acquire(p) __atomic_load_n(p, __ATOMIC_ACQUIRE)
 #define smp_store_release(p, value) __atomic_store_n(p, value, __ATOMIC_RELEASE)
 #define atomic64_read(p) (*(p))

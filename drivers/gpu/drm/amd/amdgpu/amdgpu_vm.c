@@ -3049,7 +3049,7 @@ int amdgpu_vm_init(struct amdgpu_device *adev, struct amdgpu_vm *vm,
 	ttm_lru_bulk_move_init(&vm->lru_bulk_move);
 
 	vm->is_compute_context = false;
-	vm->need_tlb_fence = amdgpu_userq_enabled(&adev->ddev);
+	vm->need_tlb_fence = false;
 
 	vm->use_cpu_for_update = !!(adev->vm_manager.vm_update_mode &
 				    AMDGPU_VM_USE_CPU_FOR_GFX);
@@ -3118,6 +3118,53 @@ error_free_delayed:
 	ttm_lru_bulk_move_fini(&adev->mman.bdev, &vm->lru_bulk_move);
 	amdgpu_vm_fini_entities(vm);
 
+	return r;
+}
+
+/**
+ * amdgpu_vm_enable_tlb_fences - prepare a VM for its first user queue
+ * @adev: amdgpu device
+ * @vm: VM whose root reservation is held
+ *
+ * Kernel queues use tlb_seq when assigning their VMID. Before user queues can
+ * bypass that submission path, finish earlier page-table writes and invalidate
+ * their translations once. Later updates then provide TLB completion fences.
+ */
+int amdgpu_vm_enable_tlb_fences(struct amdgpu_device *adev, struct amdgpu_vm *vm)
+{
+	struct dma_resv *resv = vm->root.bo->tbo.base.resv;
+	struct dma_resv_iter cursor;
+	struct drm_sched_fence *s_fence;
+	struct dma_fence *fence;
+	int r;
+
+	dma_resv_assert_held(resv);
+	if (vm->need_tlb_fence)
+		return 0;
+
+	amdgpu_vm_eviction_lock(vm);
+	r = dma_fence_wait(vm->last_unlocked, true);
+	if (r)
+		goto unlock;
+
+	/* Every locked SDMA update publishes its fence on the root reservation.
+	 * Do not wait for rendering or eviction fences, which can need a queue
+	 * that userspace has not created yet.
+	 */
+	dma_resv_for_each_fence(&cursor, resv, DMA_RESV_USAGE_BOOKKEEP, fence) {
+		s_fence = to_drm_sched_fence(fence);
+		if (!s_fence || s_fence->owner != AMDGPU_FENCE_OWNER_VM)
+			continue;
+		r = dma_fence_wait(fence, true);
+		if (r)
+			goto unlock;
+	}
+
+	r = amdgpu_gmc_flush_gpu_tlb_pasid(adev, vm->pasid, 2, true, 0);
+	if (!r)
+		WRITE_ONCE(vm->need_tlb_fence, true);
+unlock:
+	amdgpu_vm_eviction_unlock(vm);
 	return r;
 }
 
