@@ -1581,9 +1581,44 @@ static bool amdgpu_vm_bo_can_batch(struct amdgpu_vm *vm,
 		(bo_va->base.moved || bo_va->cleared || !list_empty(&bo_va->invalids));
 }
 
+/* Only accepted timeline batches may discard these records: update failures
+ * stop that VM rather than retrying clears over already submitted mappings.
+ * Every record is covered by a REPLACE in this batch. PRT has no backing BO,
+ * and ASICs without set_prt have no global PRT reference to retire either.
+ */
+bool amdgpu_vm_skip_prt_clears(struct amdgpu_device *adev,
+		struct amdgpu_vm *vm, struct xarray *bos, struct list_head *freed)
+{
+	struct amdgpu_bo_va_mapping *mapping, *tmp;
+	struct amdgpu_bo_va *bo_va;
+	unsigned long index;
+	bool skipped = false;
+
+	if (adev->gmc.gmc_funcs->set_prt || list_empty(freed))
+		return false;
+
+	/* All final mappings must be submitted by the shared native BO batch. */
+	xa_for_each(bos, index, bo_va) {
+		struct amdgpu_bo *bo = bo_va->base.bo;
+
+		if (bo && (!amdgpu_vm_is_bo_always_valid(vm, bo) ||
+			   drm_gem_is_imported(&bo->tbo.base) ||
+			   amdgpu_ttm_tt_get_usermm(bo->tbo.ttm)))
+			return false;
+	}
+	list_for_each_entry_safe(mapping, tmp, freed, list) {
+		if (!(mapping->flags & AMDGPU_VM_PAGE_PRT))
+			continue;
+		list_del(&mapping->list);
+		kfree(mapping);
+		skipped = true;
+	}
+	return skipped;
+}
+
 /* Share a submission for PRT mappings and native BOs with the root reservation. */
 int amdgpu_vm_bo_update_batch(struct amdgpu_device *adev, struct amdgpu_vm *vm,
-			      struct xarray *bos)
+			      struct xarray *bos, bool flush_tlb)
 {
 	struct amdgpu_vm_update_batch batch;
 	struct amdgpu_bo_va *bo_va, *prt_va = NULL;
@@ -1612,7 +1647,7 @@ int amdgpu_vm_bo_update_batch(struct amdgpu_device *adev, struct amdgpu_vm *vm,
 				     AMDGPU_SYNC_EXPLICIT, vm);
 	if (!r)
 		r = amdgpu_vm_update_begin(&batch, adev, vm, false, false,
-					   false, false, &sync);
+					   flush_tlb, false, &sync);
 	amdgpu_sync_free(&sync);
 	if (r)
 		return r;
