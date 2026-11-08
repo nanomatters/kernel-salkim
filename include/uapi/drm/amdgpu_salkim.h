@@ -57,12 +57,11 @@ struct drm_amdgpu_salkim_caps {
 	__u64 reserved[3];
 };
 
-/*
- * UNMAP takes struct drm_amdgpu_gem_va with operation AMDGPU_VA_OP_UNMAP.
+
+/* UNMAP takes struct drm_amdgpu_gem_va with operation AMDGPU_VA_OP_UNMAP.
  * _pad must be zero. Only AMDGPU_VM_DELAY_UPDATE is accepted in flags.
- * The caller has completed
- * every GPU access through the mapping. Movement, page-table update and TLB
- * dependencies are retained. Completion is asynchronous, as for GEM_VA.
+ * The caller has completed every GPU access through the mapping. Movement,
+ * page-table update and TLB dependencies are retained. Completion is asynchronous.
  */
 
 #define AMDGPU_GEM_VA_BATCH_MAX_OPS	4096
@@ -78,8 +77,14 @@ struct drm_amdgpu_salkim_caps {
  */
 #define AMDGPU_GEM_VA_BATCH_VM_TIMELINE	(1U << 1)
 
-/* REPLACE operations run in array order.
- * PRT with handle 0 unbinds a range.
+/* Native-queue batches may avoid implicit CS waits for their mapping updates.
+ * Requires WAIT_COMPLETE and VM_TIMELINE. Userspace must order use of the
+ * replaced ranges after the output point. Other GEM_VA updates stay implicit.
+ * Not available after the VM creates a user queue or becomes a KFD VM.
+ */
+#define AMDGPU_GEM_VA_BATCH_NO_CS_WAIT	(1U << 2)
+
+/* REPLACE operations, in array order. PRT with handle 0 unbinds a range.
  * DELAY_UPDATE is not accepted; the kernel manages pending updates.
  */
 struct drm_amdgpu_gem_va_batch_op {
@@ -91,8 +96,8 @@ struct drm_amdgpu_gem_va_batch_op {
 };
 
 /* Batched GEM_VA acceptance. Probe SALKIM capabilities before use.
- * Optional flags must be advertised in batch_features. KFD and CPU-updated VMs are not supported.
- * User-queue VMs require VM_TIMELINE.
+ * Optional flags must be advertised in batch_features. KFD and CPU-updated VMs are
+ * not supported. User-queue VMs require VM_TIMELINE.
  *
  * Without VM_TIMELINE, reserved fields must be zero and a negative ioctl return
  * leaves every mapping unchanged. A zero return accepts the entire array,
