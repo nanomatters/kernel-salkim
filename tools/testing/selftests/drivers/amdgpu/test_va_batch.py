@@ -156,6 +156,7 @@ struct amdgpu_bo { struct { struct drm_gem_object base; struct ttm_resource *res
 struct amdgpu_bo_va { struct { struct amdgpu_bo *bo; } base; struct dma_fence *last_pt_update; };
 struct amdgpu_bo_va_mapping { u64 start, last; struct amdgpu_bo_va *bo_va; };
 struct list_head { unsigned count; struct list_head *next, *prev; };
+static bool list_empty(const struct list_head *list) { return list->count == 0; }
 struct mutex { pthread_mutex_t value; };
 struct amdgpu_vm_batch_state;
 struct amdgpu_vm {
@@ -395,7 +396,10 @@ static int amdgpu_vm_clear_freed(struct amdgpu_device *adev, struct amdgpu_vm *v
 static int amdgpu_vm_clear_freed_list(struct amdgpu_device *adev, struct amdgpu_vm *vm, struct list_head *freed,
                                       unsigned sync, struct dma_fence **out)
 { assert(locked); if (failure_stage == 4) return stage_error; freed->count = 0; return 0; }
-static int amdgpu_vm_bo_update_batch(struct amdgpu_device *adev, struct amdgpu_vm *vm, struct xarray *bos)
+static bool amdgpu_vm_skip_prt_clears(struct amdgpu_device *adev, struct amdgpu_vm *vm,
+                                      struct xarray *bos, struct list_head *freed)
+{ return false; }
+static int amdgpu_vm_bo_update_batch(struct amdgpu_device *adev, struct amdgpu_vm *vm, struct xarray *bos, bool flush_tlb)
 {
     assert(locked && update_stage == 1); update_stage = 2; bind_bos = bos->count;
     if (flush_trigger == 2) {
