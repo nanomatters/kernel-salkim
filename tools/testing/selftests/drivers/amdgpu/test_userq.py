@@ -174,6 +174,7 @@ static void *memdup_array_user(const void *ptr, size_t count, size_t size)
         memcpy(copy, ptr, count * size);
     return copy;
 }
+#define kmalloc_objs(obj, count) kmalloc_array((count), sizeof(obj), GFP_KERNEL)
 static void *kmalloc_array(size_t count, size_t size, int flags)
 {
     return allocate(count * size);
