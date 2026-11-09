@@ -96,8 +96,9 @@ struct drm_amdgpu_gem_va_batch_op {
 };
 
 /* Batched GEM_VA acceptance. Probe SALKIM capabilities before use.
- * Optional flags must be advertised in batch_features. KFD and CPU-updated VMs are
- * not supported. User-queue VMs require VM_TIMELINE.
+ * Optional flags must be advertised in batch_features. KFD VMs are not supported.
+ * Both CPU and SDMA page-table updates are supported. User-queue VMs require
+ * VM_TIMELINE.
  *
  * Without VM_TIMELINE, reserved fields must be zero and a negative ioctl return
  * leaves every mapping unchanged. A zero return accepts the entire array,
