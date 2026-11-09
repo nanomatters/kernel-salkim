@@ -112,7 +112,7 @@ static int amdgpu_vm_cpu_update(struct amdgpu_vm_update_params *p,
  * amdgpu_vm_cpu_commit - commit page table update to the HW
  *
  * @p: see amdgpu_vm_update_params definition
- * @fence: unused
+ * @fence: optional completed fence for the visible CPU writes
  *
  * Make sure that the hardware sees the page table updates.
  */
@@ -126,11 +126,16 @@ static int amdgpu_vm_cpu_commit(struct amdgpu_vm_update_params *p,
 
 	mb();
 	/* A reset flushed the HDP anyway, so that here can be skipped when a reset is ongoing */
-	if (!down_read_trylock(&adev->reset_domain->sem))
-		return 0;
+	if (down_read_trylock(&adev->reset_domain->sem)) {
+		amdgpu_device_flush_hdp(adev, NULL);
+		up_read(&adev->reset_domain->sem);
+	}
 
-	amdgpu_device_flush_hdp(adev, NULL);
-	up_read(&adev->reset_domain->sem);
+	/* The shared update path needs a fence to order TLB invalidation. */
+	if (fence) {
+		dma_fence_put(*fence);
+		*fence = dma_fence_get_stub();
+	}
 
 	return 0;
 }
