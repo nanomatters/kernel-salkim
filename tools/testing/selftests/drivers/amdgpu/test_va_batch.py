@@ -205,6 +205,7 @@ static struct amdgpu_bo_va_mapping old_mappings[4];
 static bool become_unready;
 static int stage_error;
 static bool missing_mapping, mode_changed;
+static bool test_cpu_updates;
 static _Thread_local bool locked;
 static unsigned failure_stage, tlb_failure, dependency_stage;
 static unsigned flush_trigger;
@@ -490,6 +491,7 @@ static void setup(bool userq)
     memset(operations, 0, sizeof(operations)); memset(applied, 0, sizeof(applied));
     device = (struct amdgpu_device){.userq = userq, .vm_manager.max_pfn = UINT64_C(1) << 24};
     drm.adev = &device; file.driver_priv = &priv;
+    priv.vm.use_cpu_for_update = test_cpu_updates;
     for (unsigned i = 0; i < ARRAY_SIZE(leaves); i++) leaves[i].refs = 1;
     for (unsigned i = 0; i < ARRAY_SIZE(objects); i++) {
         resources[i].mem_type = TTM_PL_VRAM;
@@ -624,12 +626,11 @@ static void timeline_tests(void)
     }
     setup(true); a = request(true); resources[1].mem_type = TTM_PL_TT;
     assert(run(&a) == 0 && mutations == 3 && published == 1); cleanup();
-    for (unsigned n = 0; n < 4; n++) {
+    for (unsigned n = 0; n < 3; n++) {
         setup(true); a = request(true);
         if (n == 0) device.debug_vm = true;
-        if (n == 1) priv.vm.use_cpu_for_update = true;
-        if (n == 2) priv.vm.is_compute_context = true;
-        if (n == 3) mode_changed = true;
+        if (n == 1) priv.vm.is_compute_context = true;
+        if (n == 2) mode_changed = true;
         assert(run(&a) == -EOPNOTSUPP && !mutations && !published); cleanup();
     }
     /* No post-mutation error may masquerade as rejection or request a restart. */
@@ -741,7 +742,7 @@ static void capability_and_limit_tests(void)
         setup(userq);
         assert(amdgpu_gem_va_batch_supported(&device, &priv.vm, true));
         assert(amdgpu_gem_va_batch_supported(&device, &priv.vm, false) == !userq);
-        priv.vm.use_cpu_for_update = true;
+        priv.vm.is_compute_context = true;
         assert(!amdgpu_gem_va_batch_supported(&device, &priv.vm, true));
         assert(!amdgpu_gem_va_batch_supported(&device, &priv.vm, false));
         cleanup();
@@ -889,17 +890,56 @@ static void concurrency_test(void)
     }
 }
 
+#ifdef AMDGPU_GEM_VA_BATCH_NO_CS_WAIT
+static void explicit_completion_tests(void)
+{
+    for (unsigned failure = 0; failure < 2; ++failure) {
+        setup(false);
+        struct drm_amdgpu_gem_va_batch a = request(true);
+        a.flags |= AMDGPU_GEM_VA_BATCH_WAIT_COMPLETE | AMDGPU_GEM_VA_BATCH_NO_CS_WAIT;
+        for (unsigned i = 0; i < ARRAY_SIZE(objects); ++i)
+            objects[i].always_valid = true;
+        for (unsigned i = 0; i < ARRAY_SIZE(leaves); ++i)
+            leaves[i].signaled = true;
+        /* Completion must still cover an older bind, even with CPU writes. */
+        leaves[0].signaled = false;
+        assert(!run(&a) && published == 1 && !dependency_stage);
+        assert(priv.vm.last_update == &leaves[4] && prt.last_pt_update == &leaves[6]);
+        assert(first_syncobj.fence == priv.vm.last_bind && pending_callbacks);
+        assert(!dma_fence_is_signaled(first_syncobj.fence) && priv.vm.tlb_seq == 1);
+        leaves[0].error = failure ? -EIO : 0;
+        leaves[0].signaled = true;
+        pump_callbacks();
+        assert(dma_fence_is_signaled(first_syncobj.fence) && priv.vm.tlb_seq == 2);
+        assert(amdgpu_vm_batch_status(&priv.vm) == (failure ? -EIO : 0));
+        cleanup();
+    }
+    /* An explicit bind must still be rejected on a VM with live user queues. */
+    setup(true);
+    struct drm_amdgpu_gem_va_batch a = request(true);
+    a.flags |= AMDGPU_GEM_VA_BATCH_WAIT_COMPLETE | AMDGPU_GEM_VA_BATCH_NO_CS_WAIT;
+    assert(run(&a) == -EOPNOTSUPP && !mutations && !published);
+    cleanup();
+}
+#endif
+
 int main(void)
 {
-    legacy_tests();
-    timeline_tests();
-    validation_tests();
-    boundary_tests();
-    capability_and_limit_tests();
-    query_tests();
-    conditional_flush_tests();
-    sticky_ioctl_tests();
-    concurrency_test();
+    for (unsigned backend = 0; backend < 2; ++backend) {
+        test_cpu_updates = backend;
+        legacy_tests();
+        timeline_tests();
+        validation_tests();
+        boundary_tests();
+        capability_and_limit_tests();
+        query_tests();
+        conditional_flush_tests();
+        sticky_ioctl_tests();
+        concurrency_test();
+#ifdef AMDGPU_GEM_VA_BATCH_NO_CS_WAIT
+        explicit_completion_tests();
+#endif
+    }
     printf("VA batch: %u cases passed\n", cases);
     return 0;
 }

@@ -1111,8 +1111,7 @@ error_put_gobj:
 bool amdgpu_gem_va_batch_supported(struct amdgpu_device *adev,
 				   struct amdgpu_vm *vm, bool timeline)
 {
-	return !adev->debug_vm && !vm->use_cpu_for_update &&
-		!vm->is_compute_context &&
+	return !adev->debug_vm && !vm->is_compute_context &&
 		(timeline || (!READ_ONCE(vm->need_tlb_fence) &&
 			      !amdgpu_userq_enabled(adev_to_drm(adev))));
 }
