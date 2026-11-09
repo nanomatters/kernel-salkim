@@ -118,6 +118,7 @@ static void kref_init(struct kref *ref) { ref->refs = 1; }
 static u64 dma_fence_context_alloc(unsigned count) { static u64 context; return context += count; }
 static int amdgpu_seq64_alloc(struct amdgpu_device *dev, u64 *va, u64 *gpu, u64 **cpu)
 { *va = 0x1000; *gpu = 0x2000; *cpu = &seq64_word; return 0; }
+#define kmalloc_objs(obj, count) kmalloc_array((count), sizeof(obj), GFP_KERNEL)
 static void *kmalloc_array(size_t count, size_t size, int flags)
 { void *p = calloc(count ? count : 1, size); assert(p); return p; }
 static struct dma_fence *dma_fence_get(struct dma_fence *f) { assert(f->refs); f->refs++; return f; }
