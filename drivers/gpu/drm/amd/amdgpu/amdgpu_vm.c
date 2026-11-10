@@ -2329,9 +2329,10 @@ int amdgpu_vm_bo_unmap(struct amdgpu_device *adev,
  *
  * Remove all mappings in a range, split them as appropriate.
  *
+ * The caller validates the range and reserves the VM first.
  * Consumes both records, retaining used splits and freeing unused ones.
  */
-static void amdgpu_vm_bo_clear_mappings_prealloc(struct amdgpu_device *adev,
+void amdgpu_vm_bo_clear_mappings_prealloc(struct amdgpu_device *adev,
 				struct amdgpu_vm *vm, uint64_t saddr, uint64_t size,
 				struct amdgpu_bo_va_mapping *before,
 				struct amdgpu_bo_va_mapping *after,

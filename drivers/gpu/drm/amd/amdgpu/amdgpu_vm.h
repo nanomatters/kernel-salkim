@@ -600,6 +600,11 @@ void amdgpu_vm_bo_replace_map_prealloc(struct amdgpu_device *adev,
 int amdgpu_vm_bo_unmap(struct amdgpu_device *adev,
 		       struct amdgpu_bo_va *bo_va,
 		       uint64_t addr);
+void amdgpu_vm_bo_clear_mappings_prealloc(struct amdgpu_device *adev,
+		struct amdgpu_vm *vm, uint64_t saddr, uint64_t size,
+		struct amdgpu_bo_va_mapping *before,
+		struct amdgpu_bo_va_mapping *after,
+		struct list_head *freed, bool *explicit_sync);
 int amdgpu_vm_bo_clear_mappings(struct amdgpu_device *adev,
 				struct amdgpu_vm *vm,
 				uint64_t saddr, uint64_t size);
