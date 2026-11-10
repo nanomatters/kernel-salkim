@@ -97,7 +97,13 @@ struct drm_amdgpu_salkim_userq_create {
  */
 #define AMDGPU_GEM_VA_BATCH_NO_CS_WAIT	(1U << 2)
 
-/* REPLACE operations, in array order. PRT with handle 0 unbinds a range.
+/* Remove every mapping in each range. Each operation's handle, flags and
+ * offset_in_bo must be zero. Cannot be combined with NO_CS_WAIT.
+ */
+#define AMDGPU_GEM_VA_BATCH_CLEAR		(1U << 3)
+
+/* Operations run in array order: CLEAR when requested, otherwise REPLACE.
+ * REPLACE with PRT and handle 0 unbinds a range.
  * DELAY_UPDATE is not accepted; the kernel manages pending updates.
  */
 struct drm_amdgpu_gem_va_batch_op {
