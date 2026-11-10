@@ -35,6 +35,7 @@
 #include "amdgpu_hmm.h"
 #include "amdgpu_userq_fence.h"
 #include "amdgpu_trace.h"
+#include "mes_userqueue.h"
 
 u32 amdgpu_userq_get_supported_ip_mask(struct amdgpu_device *adev)
 {
@@ -47,6 +48,15 @@ u32 amdgpu_userq_get_supported_ip_mask(struct amdgpu_device *adev)
 	}
 
 	return userq_ip_mask;
+}
+
+bool amdgpu_userq_supports_relative_priority(struct amdgpu_device *adev,
+					     u32 ip_type)
+{
+	if (ip_type != AMDGPU_HW_IP_GFX && ip_type != AMDGPU_HW_IP_COMPUTE)
+		return false;
+
+	return adev->userq_funcs[ip_type] == &userq_mes_funcs;
 }
 
 static bool amdgpu_userq_is_reset_type_supported(struct amdgpu_device *adev,
@@ -768,7 +778,9 @@ static int amdgpu_userq_priority_permit(struct drm_file *filp,
 }
 
 static int
-amdgpu_userq_create(struct drm_file *filp, union drm_amdgpu_userq *args)
+amdgpu_userq_create(struct drm_file *filp, union drm_amdgpu_userq *args,
+		    const int *relative_priority,
+		    struct amdgpu_usermode_queue **created_queue)
 {
 	struct amdgpu_fpriv *fpriv = filp->driver_priv;
 	struct amdgpu_userq_mgr *uq_mgr = &fpriv->userq_mgr;
@@ -832,6 +844,9 @@ amdgpu_userq_create(struct drm_file *filp, union drm_amdgpu_userq *args)
 	queue->queue_type = args->in.ip_type;
 	queue->vm = &fpriv->vm;
 	queue->priority = priority;
+	queue->relative_priority = relative_priority ? *relative_priority :
+		AMDGPU_MES_PRIORITY_LEVEL_NORMAL;
+	queue->relative_priority_set = relative_priority;
 	queue->xcp_id = (fpriv->xcp_id != AMDGPU_XCP_NO_PARTITION) ?
 				fpriv->xcp_id : 0;
 	queue->userq_mgr = uq_mgr;
@@ -914,6 +929,9 @@ amdgpu_userq_create(struct drm_file *filp, union drm_amdgpu_userq *args)
 	atomic_inc(&uq_mgr->userq_count[queue->queue_type]);
 	mutex_unlock(&uq_mgr->userq_mutex);
 
+	/* Hold an exact identity for private create copy-out and rollback. */
+	if (created_queue)
+		kref_get(&queue->refcount);
 	r = xa_alloc(&uq_mgr->userq_xa, &qid, queue,
 		     XA_LIMIT(1, AMDGPU_MAX_USERQ_COUNT),
 		     GFP_KERNEL);
@@ -923,6 +941,8 @@ amdgpu_userq_create(struct drm_file *filp, union drm_amdgpu_userq *args)
 		 * all cleanup.
 		 */
 		trace_amdgpu_userq_create_end(queue, r);
+		if (created_queue)
+			amdgpu_userq_put(queue);
 		amdgpu_userq_put(queue);
 		return r;
 	}
@@ -930,6 +950,8 @@ amdgpu_userq_create(struct drm_file *filp, union drm_amdgpu_userq *args)
 	amdgpu_debugfs_userq_init(filp, queue, qid);
 	trace_amdgpu_userq_create_end(queue, 0);
 	args->out.queue_id = qid;
+	if (created_queue)
+		*created_queue = queue;
 	return 0;
 
 erase_doorbell:
@@ -1058,7 +1080,7 @@ int amdgpu_userq_ioctl(struct drm_device *dev, void *data,
 
 	switch (args->in.op) {
 	case AMDGPU_USERQ_OP_CREATE:
-		r = amdgpu_userq_create(filp, args);
+		r = amdgpu_userq_create(filp, args, NULL, NULL);
 		if (r)
 			drm_file_err(filp, "Failed to create usermode queue\n");
 		break;
@@ -1080,6 +1102,44 @@ int amdgpu_userq_ioctl(struct drm_device *dev, void *data,
 	}
 
 	return r;
+}
+
+int amdgpu_userq_create_relative(struct drm_device *dev,
+				 union drm_amdgpu_userq *args,
+				 struct drm_file *filp, int priority,
+				 struct amdgpu_usermode_queue **created_queue)
+{
+	int r;
+
+	if (!amdgpu_userq_enabled(dev))
+		return -EOPNOTSUPP;
+	if (args->in.op != AMDGPU_USERQ_OP_CREATE || priority < -7 || priority > 7)
+		return -EINVAL;
+	r = amdgpu_userq_input_args_validate(dev, args, filp);
+	if (r)
+		return r;
+	if (!amdgpu_userq_supports_relative_priority(drm_to_adev(dev), args->in.ip_type))
+		return -EOPNOTSUPP;
+
+	return amdgpu_userq_create(filp, args, &priority, created_queue);
+}
+
+/* The caller holds a reference, even if another thread reused the queue ID. */
+void amdgpu_userq_create_rollback(struct drm_file *filp, u32 qid,
+				  struct amdgpu_usermode_queue *queue)
+{
+	struct amdgpu_fpriv *fpriv = filp->driver_priv;
+	struct xarray *queues = &fpriv->userq_mgr.userq_xa;
+	bool removed = false;
+
+	xa_lock(queues);
+	if (xa_load(queues, qid) == queue) {
+		__xa_erase(queues, qid);
+		removed = true;
+	}
+	xa_unlock(queues);
+	if (removed)
+		amdgpu_userq_put(queue);
 }
 
 static int

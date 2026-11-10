@@ -93,6 +93,10 @@ _Static_assert(offsetof(struct drm_amdgpu_salkim_request, payload_size) == 24, "
 _Static_assert(sizeof(struct drm_amdgpu_salkim_caps) == 64, "capability size");
 _Static_assert(offsetof(struct drm_amdgpu_salkim_caps, features) == 16, "feature bits");
 _Static_assert(offsetof(struct drm_amdgpu_salkim_caps, reserved) == 40, "future extension");
+_Static_assert(offsetof(struct drm_amdgpu_salkim_userq_create, relative_priority) ==
+               sizeof(union drm_amdgpu_userq), "priority position");
+_Static_assert(sizeof(struct drm_amdgpu_salkim_userq_create) ==
+               sizeof(union drm_amdgpu_userq) + 8, "create size");
 _Static_assert(_IOC_TYPE(AMDGPU_SALKIM_IOCTL) != DRM_IOCTL_BASE, "separate namespace");
 _Static_assert(_IOC_NR(AMDGPU_SALKIM_IOCTL) == 0x4b, "fixed command");
 _Static_assert(_IOC_SIZE(AMDGPU_SALKIM_IOCTL) == 32, "fixed envelope");
@@ -185,10 +189,39 @@ static bool amdgpu_gem_va_batch_supported(struct amdgpu_device *adev, struct amd
                                          bool timeline) { return true; }
 static bool amdgpu_gem_va_batch_no_cs_wait_supported(struct amdgpu_device *adev,
                                                     struct amdgpu_vm *vm) { return true; }
+static bool amdgpu_userq_supports_relative_priority(struct amdgpu_device *adev, unsigned ip)
+{ return ip == AMDGPU_HW_IP_GFX; }
 static int amdgpu_gem_va_batch_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
 {
     ++batch_calls;
     return backend_result;
+}
+
+struct amdgpu_usermode_queue { unsigned refs; };
+static struct amdgpu_usermode_queue created;
+static int amdgpu_userq_create_relative(struct drm_device *dev, union drm_amdgpu_userq *args,
+                                        struct drm_file *filp, int relative,
+                                        struct amdgpu_usermode_queue **queue)
+{
+    ++create_calls;
+    if (backend_result) return backend_result;
+    assert(args->in.op == AMDGPU_USERQ_OP_CREATE);
+    args->out.queue_id = 123;
+    created.refs = 2;
+    *queue = &created;
+    return 0;
+}
+static void amdgpu_userq_create_rollback(struct drm_file *filp, u32 id,
+                                         struct amdgpu_usermode_queue *queue)
+{
+    assert(id == 123 && queue == &created && queue->refs == 2);
+    --queue->refs;
+    ++free_calls;
+}
+static void amdgpu_userq_put(struct amdgpu_usermode_queue *queue)
+{
+    assert(queue == &created && queue->refs);
+    --queue->refs;
 }
 
 static int drm_ioctl_kernel(struct file *file,
@@ -223,8 +256,9 @@ int main(void)
         unsigned char bytes[4096];
         struct drm_amdgpu_salkim_caps caps;
         struct drm_amdgpu_gem_va_batch batch;
+        struct drm_amdgpu_salkim_userq_create create;
     } payload = {0};
-    const unsigned sizes[] = {0, sizeof(payload.caps), sizeof(payload.batch), 0, 0};
+    const unsigned sizes[] = {0, sizeof(payload.caps), sizeof(payload.batch), 0, sizeof(payload.create)};
     struct drm_amdgpu_salkim_request req = {.magic = AMDGPU_SALKIM_MAGIC,
         .abi = AMDGPU_SALKIM_ABI, .op = AMDGPU_SALKIM_OP_CAPS,
         .payload = (uintptr_t)&payload, .payload_size = sizeof(payload.caps)};
@@ -269,7 +303,7 @@ int main(void)
     assert(!amdgpu_salkim_dispatch(&file, (uintptr_t)&req));
     assert(payload.caps.magic == AMDGPU_SALKIM_MAGIC && payload.caps.abi == AMDGPU_SALKIM_ABI);
     assert(payload.caps.size == sizeof(payload.caps));
-    assert(!payload.caps.relative_priority_ip_mask);
+    assert(payload.caps.relative_priority_ip_mask == BIT(AMDGPU_HW_IP_GFX));
     for (unsigned i = 0; i < 3; ++i) assert(!payload.caps.reserved[i]);
     no_backend(); assert(copies_in == 1 && copies_out == 1);
     reset_counters(); req = good; fail_out = true;
@@ -283,6 +317,7 @@ int main(void)
         if (!sizes[op]) continue;
         reset_counters(); memset(&payload, 0, sizeof(payload));
         req = good; req.op = op; req.payload_size = sizes[op];
+        if (op == 4) payload.create.args.in.op = AMDGPU_USERQ_OP_CREATE;
         fail_in = true;
         assert(amdgpu_salkim_ioctl(&dev, &req, &filp) == -EFAULT);
         no_backend(); assert(!copies_out);
@@ -301,8 +336,17 @@ int main(void)
         assert(amdgpu_salkim_ioctl(&dev, &req, &filp) == (op == 4 ? -EFAULT : 0));
         assert(copies_out == (op == 4));
         assert(free_calls == (op == 4));
+        if (op == 4) assert(created.refs == 0);
         assert(batch_calls + unmap_calls + create_calls == 1);
     }
+    reset_counters(); memset(&payload, 0, sizeof(payload));
+    req = good; req.op = AMDGPU_SALKIM_OP_USERQ_CREATE; req.payload_size = sizeof(payload.create);
+    payload.create.reserved = 1;
+    assert(amdgpu_salkim_ioctl(&dev, &req, &filp) == -EINVAL); no_backend();
+    payload.create.reserved = 0; payload.create.args.in.op = AMDGPU_USERQ_OP_CREATE;
+    assert(!amdgpu_salkim_ioctl(&dev, &req, &filp));
+    assert(payload.create.args.out.queue_id == 123 && create_calls == 1 && !free_calls);
+    assert(created.refs == 1);
     puts("Private ioctl validation, admission, zero-tail extension, acceptance and copy-fault checks passed");
     return 0;
 }
