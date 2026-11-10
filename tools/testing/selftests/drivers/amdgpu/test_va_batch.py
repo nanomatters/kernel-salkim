@@ -47,6 +47,9 @@ class VaBatchTests(unittest.TestCase):
         private = re.search(r'^bool amdgpu_vm_range_is_private\(.*?^\}', vm, re.M | re.S)
         self.assertIsNotNone(private)
         functions = private.group() + '\n' + state + '\n' + timeline.group() + '\n' + boundary.group() + '\n' + body
+        map_validate = re.search(r'^int amdgpu_vm_bo_map_validate\(.*?^\}', vm, re.M | re.S)
+        self.assertIsNotNone(map_validate)
+        functions = map_validate.group() + '\n' + functions
         private_uapi = (AMD / 'amdgpu_salkim.c').read_text()
         caps = re.search(r'^static void amdgpu_salkim_get_caps\(.*?^\}',
                          private_uapi, re.M | re.S)
@@ -202,6 +205,7 @@ static unsigned fail_allocation;
 static unsigned mutations, published, update_stage, cases, lookup_fail, lock_fail, syncobj_fail;
 static unsigned preparation_allocations, bind_bos, locked_handles, updated_handles;
 static unsigned clear_calls, replace_calls, lookup_calls, skip_prt_calls;
+static unsigned map_calls, boundary_lookups, mapping_allocations;
 static struct amdgpu_bo_va_mapping old_mappings[4];
 static bool become_unready;
 static int stage_error;
@@ -247,7 +251,11 @@ static void *allocate(size_t size)
 static void release(void *p) { if (p) { assert(live_allocations); live_allocations--; free(p); } }
 #define kfree release
 #define kvfree release
-#define kzalloc_obj(o) allocate(sizeof(o))
+#define kzalloc_obj(o) allocate_object(sizeof(o), __builtin_types_compatible_p(typeof(o), struct amdgpu_bo_va_mapping))
+static void *allocate_object(size_t size, bool mapping)
+{ void *p = allocate(size); if (p && mapping) mapping_allocations++; return p; }
+static void sort(void *base, size_t count, size_t size, int (*compare)(const void *, const void *), void *swap)
+{ qsort(base, count, size, compare); }
 #define kvcalloc(n, s, flags) allocate((n) * (s))
 #define kcalloc(n, s, flags) allocate((n) * (s))
 #define kmalloc_array(n, s, flags) allocate((n) * (s))
@@ -278,6 +286,7 @@ static struct amdgpu_bo_va *amdgpu_vm_bo_find(struct amdgpu_vm *vm, struct amdgp
 static struct amdgpu_bo_va_mapping *amdgpu_vm_bo_lookup_mapping(struct amdgpu_vm *vm, u64 addr)
 {
     assert(locked);
+    boundary_lookups++;
     u64 page = addr / AMDGPU_GPU_PAGE_SIZE;
     for (unsigned i = 0; i < ARRAY_SIZE(old_mappings); i++)
         if (old_mappings[i].bo_va && page >= old_mappings[i].start && page <= old_mappings[i].last)
@@ -302,7 +311,8 @@ static bool drm_gem_is_imported(struct drm_gem_object *obj) { return obj->import
 static void *amdgpu_ttm_tt_get_usermm(void *ttm) { return ttm; }
 static int amdgpu_vm_verify_parameters(struct amdgpu_device *adev, struct amdgpu_bo *bo,
                                       u64 addr, u64 offset, u64 size)
-{ return !size || ((addr | offset | size) & 4095) ? -EINVAL : 0; }
+{ u64 end; return !size || ((addr | offset | size) & 4095) ||
+    check_add_overflow(offset, size, &end) ? -EINVAL : 0; }
 static void drm_exec_init(struct drm_exec *exec, unsigned flags, unsigned count)
 { assert(!locked); exec->locked = false; }
 static int drm_exec_lock_obj(struct drm_exec *exec, struct drm_gem_object *obj)
@@ -440,6 +450,21 @@ static void amdgpu_vm_bo_replace_map_prealloc(struct amdgpu_device *adev, struct
     freed->count++;
     for (unsigned i = 0; i < 3; i++) { release(maps[i]); maps[i] = NULL; }
 }
+static void amdgpu_vm_bo_map_prealloc(struct amdgpu_device *adev, struct amdgpu_bo_va *bo_va,
+                                      u64 va, u64 offset, u64 size, u32 flags,
+                                      struct amdgpu_bo_va_mapping *mapping)
+{
+    assert(locked && mapping && mutations < ARRAY_SIZE(applied));
+    if (!mutations) preparation_allocations = allocation_count;
+    assert(allocation_count == preparation_allocations);
+    if (become_unready) priv.vm.ready = false;
+    applied[mutations++] = (struct drm_amdgpu_gem_va_batch_op) {
+        .handle = bo_va->base.bo ? bo_va->base.bo->tbo.base.handle : 0,
+        .flags = flags, .va_address = va, .offset_in_bo = offset, .map_size = size,
+    };
+    map_calls++;
+    release(mapping);
+}
 static void amdgpu_vm_bo_clear_mappings_prealloc(struct amdgpu_device *adev, struct amdgpu_vm *vm,
                                                  u64 va, u64 size,
                                                  struct amdgpu_bo_va_mapping *before,
@@ -502,6 +527,7 @@ static void setup(bool userq)
     lookup_fail = lock_fail = syncobj_fail = failure_stage = tlb_failure = dependency_stage = 0;
     preparation_allocations = bind_bos = locked_handles = updated_handles = 0;
     clear_calls = replace_calls = lookup_calls = skip_prt_calls = 0;
+    map_calls = boundary_lookups = mapping_allocations = 0;
     memset(old_mappings, 0, sizeof(old_mappings)); stage_error = -ENOMEM;
     flush_trigger = 1;
     missing_mapping = mode_changed = become_unready = false; bad_pointer = (void *)1;
@@ -835,6 +861,137 @@ static void clear_tests(void)
 #endif
 }
 
+static struct drm_amdgpu_gem_va_batch map_request(bool timeline)
+{
+    struct drm_amdgpu_gem_va_batch a = request(timeline);
+    a.flags |= AMDGPU_GEM_VA_BATCH_MAP;
+    operations[0].offset_in_bo = 8192;
+    operations[2].va_address = 0x30000;
+    return a;
+}
+
+static void map_tests(void)
+{
+    for (unsigned timeline = 0; timeline <= 1; timeline++) {
+        for (unsigned complete = 0; complete <= 1; complete++) {
+            setup(timeline); struct drm_amdgpu_gem_va_batch a = map_request(timeline);
+            if (complete) a.flags |= AMDGPU_GEM_VA_BATCH_WAIT_COMPLETE;
+            old_mappings[0] = (struct amdgpu_bo_va_mapping){.start = 0xf, .last = 0xf,
+                                                                         .bo_va = &mappings[3]};
+            old_mappings[1] = (struct amdgpu_bo_va_mapping){.start = 0x11, .last = 0x11,
+                                                                         .bo_va = &mappings[3]};
+            assert(!run(&a) && map_calls == 3 && !clear_calls && !replace_calls);
+            assert(mapping_allocations == 3 && !boundary_lookups && !skip_prt_calls);
+            assert(lookup_calls == 2 && bind_bos == 3 && published == timeline && !(locked_handles & 8));
+            assert(!memcmp(applied, operations, a.count * sizeof(*operations)));
+            if (timeline) {
+                struct dma_fence_array *array = (void *)first_syncobj.fence->dependency;
+                assert(array->capacity == 5 && array->num_fences == 5);
+                const unsigned dependencies[] = {1, 2, 4, 5, 6};
+                first_syncobj.fence->signaled = true;
+                for (unsigned i = 0; i < ARRAY_SIZE(dependencies); i++) {
+                    for (unsigned j = 0; j < ARRAY_SIZE(leaves); j++) leaves[j].signaled = true;
+                    leaves[dependencies[i]].signaled = false;
+                    assert(!dma_fence_is_signaled(first_syncobj.fence));
+                }
+            }
+            unsigned allocations = preparation_allocations;
+            cleanup();
+            for (unsigned fail = 1; fail <= allocations; fail++) {
+                setup(timeline); a = map_request(timeline);
+                if (complete) a.flags |= AMDGPU_GEM_VA_BATCH_WAIT_COMPLETE;
+                fail_allocation = fail;
+                assert(run(&a) == -ENOMEM && !mutations && !published);
+                cleanup();
+            }
+        }
+        /* Existing mappings, including a conflict in the final entry, remain intact. */
+        for (unsigned overlap = 0; overlap < 4; overlap++) {
+            setup(timeline); struct drm_amdgpu_gem_va_batch a = map_request(timeline);
+            const u64 starts[] = {0x10, 0xf, 0x12, 0x30};
+            const u64 ends[] = {0x10, 0x11, 0x13, 0x30};
+            if (overlap == 2) operations[0].map_size = 4 * 4096;
+            old_mappings[0] = (struct amdgpu_bo_va_mapping){.start = starts[overlap], .last = ends[overlap],
+                                                                         .bo_va = &mappings[3]};
+            assert(run(&a) == -EINVAL && !mutations && !published && !boundary_lookups);
+            assert(old_mappings[0].bo_va == &mappings[3]); cleanup();
+        }
+        /* The array is checked as a whole, including duplicate and contained ranges. */
+        for (unsigned overlap = 0; overlap < 4; overlap++) {
+            setup(timeline); struct drm_amdgpu_gem_va_batch a = map_request(timeline);
+            if (overlap == 0) operations[2].va_address = operations[0].va_address;
+            if (overlap == 1) { operations[2].va_address = 0xf000; operations[2].map_size = 8192; }
+            if (overlap == 2) { operations[2].va_address = 0xf000; operations[2].map_size = 0x30000; }
+            if (overlap == 3) { operations[0].map_size = 0x21000; }
+            assert(run(&a) == -EINVAL && !mutations && !published); cleanup();
+        }
+        /* Canonical high addresses are normalized before validation and insertion. */
+        setup(timeline); struct drm_amdgpu_gem_va_batch high = map_request(timeline);
+        high.count = 1; device.vm_manager.max_pfn = UINT64_C(1) << 36;
+        operations[0].va_address = AMDGPU_GMC_HOLE_END | 0x10000;
+        assert(!run(&high) && map_calls == 1);
+        assert(applied[0].va_address == (operations[0].va_address & AMDGPU_GMC_HOLE_MASK));
+        cleanup();
+        setup(timeline); high = map_request(timeline);
+        high.count = 1; device.vm_manager.max_pfn = UINT64_C(1) << 36;
+        operations[0].va_address = AMDGPU_GMC_HOLE_END | 0x10000;
+        u64 page = (operations[0].va_address & AMDGPU_GMC_HOLE_MASK) / AMDGPU_GPU_PAGE_SIZE;
+        old_mappings[0] = (struct amdgpu_bo_va_mapping){.start = page, .last = page, .bo_va = &mappings[3]};
+        assert(run(&high) == -EINVAL && !mutations && !published); cleanup();
+        /* Descending input keeps caller order; only the overlap index is sorted. */
+        setup(timeline); struct drm_amdgpu_gem_va_batch a = map_request(timeline);
+        a.count = AMDGPU_GEM_VA_BATCH_MAX_OPS;
+        for (unsigned i = 0; i < a.count; i++)
+            operations[i] = (struct drm_amdgpu_gem_va_batch_op){.handle = 1 + (i & 1),
+                .flags = AMDGPU_VM_PAGE_READABLE, .va_address = 0x10000 + (a.count - i) * UINT64_C(4096),
+                .offset_in_bo = (i & 1) * 4096, .map_size = 4096};
+        assert(!run(&a) && map_calls == a.count && mapping_allocations == a.count && !boundary_lookups);
+        assert(!memcmp(applied, operations, a.count * sizeof(*operations))); cleanup();
+        for (unsigned bad = 0; bad < 11; bad++) {
+            setup(timeline); a = map_request(timeline);
+            switch (bad) {
+            case 0: a.flags |= AMDGPU_GEM_VA_BATCH_CLEAR; break;
+            case 1: operations[2].handle = 1; break;
+            case 2: operations[2].offset_in_bo = 4096; break;
+            case 3: operations[2].flags |= AMDGPU_VM_PAGE_READABLE; break;
+            case 4: operations[1].flags |= AMDGPU_VM_DELAY_UPDATE; break;
+            case 5: operations[2].map_size = 0; break;
+            case 6: operations[2].va_address++; break;
+            case 7: operations[2].map_size = UINT64_MAX; break;
+            case 8: operations[0].offset_in_bo = UINT64_MAX - 4095; break;
+            case 9: operations[0].va_address = AMDGPU_GMC_HOLE_START; break;
+            case 10: operations[0].va_address = AMDGPU_GMC_HOLE_MASK & ~UINT64_C(4095); break;
+            }
+            assert(run(&a) == -EINVAL && !mutations && !published); cleanup();
+        }
+        for (unsigned stage = 1; stage <= 4; stage++) {
+            setup(timeline); a = map_request(timeline);
+            a.flags |= AMDGPU_GEM_VA_BATCH_WAIT_COMPLETE;
+            failure_stage = stage;
+            assert(run(&a) == (timeline ? -EIO : 0) && map_calls == 3 && !published);
+            if (timeline) assert(amdgpu_vm_batch_status(&priv.vm) == -EIO);
+            cleanup();
+        }
+    }
+    setup(false); struct drm_amdgpu_gem_va_batch a = map_request(false); priv.vm.ready = false;
+    assert(!run(&a) && map_calls == 3 && !priv.vm.freed.count && !update_stage); cleanup();
+    for (unsigned failure = 0; failure < 4; failure++) {
+        setup(true); a = map_request(true);
+        if (failure == 0) priv.vm.ready = false;
+        if (failure == 1) resources[2].mem_type = TTM_PL_SYSTEM;
+        if (failure == 2) objects[2].tbo.resource = NULL;
+        if (failure == 3) lock_fail = 2;
+        assert(run(&a) == (failure == 3 ? -EINTR : -EBUSY) && !mutations && !published); cleanup();
+    }
+    setup(true); a = map_request(true); tlb_failure = 1;
+    assert(run(&a) == -EIO && map_calls == 3 && !published); cleanup();
+#ifdef AMDGPU_GEM_VA_BATCH_NO_CS_WAIT
+    setup(false); a = map_request(true);
+    a.flags |= AMDGPU_GEM_VA_BATCH_NO_CS_WAIT | AMDGPU_GEM_VA_BATCH_WAIT_COMPLETE;
+    assert(run(&a) == -EINVAL && !mutations && !published); cleanup();
+#endif
+}
+
 static void boundary_tests(void)
 {
     for (unsigned sides = 1; sides <= 3; sides++) {
@@ -940,7 +1097,7 @@ static void query_tests(void)
         if (timeline) {
             assert(caps.batch_features == (AMDGPU_GEM_VA_BATCH_WAIT_COMPLETE |
                 AMDGPU_GEM_VA_BATCH_VM_TIMELINE | AMDGPU_GEM_VA_BATCH_CLEAR |
-                0 |
+                AMDGPU_GEM_VA_BATCH_MAP |
                 (!mapped_userq ? AMDGPU_GEM_VA_BATCH_NO_CS_WAIT : 0)));
         } else {
             assert(!caps.batch_features);
@@ -1079,6 +1236,7 @@ int main(void)
         validation_tests();
         boundary_tests();
         clear_tests();
+        map_tests();
         capability_and_limit_tests();
         query_tests();
         conditional_flush_tests();
