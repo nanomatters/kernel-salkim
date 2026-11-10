@@ -10,7 +10,7 @@
  * Handles and synchronization objects belong to this same DRM file.
  *
  * This fixed, input-only envelope never copies output after an operation has
- * been accepted. Only CAPS writes its pointed-to payload.
+ * been accepted. Only CAPS and USERQ_CREATE write their pointed-to payload.
  * All members use fixed widths and have the same offsets on 32/64-bit systems.
  * Unknown operations, ABI values and reserved bits are rejected. Input payloads
  * may have a zero-filled tail, up to 4096 bytes total. Truncated mandatory
@@ -38,6 +38,7 @@ struct drm_amdgpu_salkim_request {
 
 #define AMDGPU_SALKIM_OP_CAPS 1
 #define AMDGPU_SALKIM_OP_VA_BATCH 2
+#define AMDGPU_SALKIM_OP_USERQ_CREATE 4
 
 #define AMDGPU_SALKIM_CAP_BATCH_LEGACY (1ULL << 0)
 #define AMDGPU_SALKIM_CAP_BATCH_TIMELINE (1ULL << 1)
@@ -55,6 +56,18 @@ struct drm_amdgpu_salkim_caps {
 	__u64 reserved[3];
 };
 
+/*
+ * USERQ_CREATE takes this payload. args.in.op must be AMDGPU_USERQ_OP_CREATE,
+ * and args.in.flags uses only standard AMDGPU global priority/security flags.
+ * relative_priority is independently signed from -7 to 7. Creation failure
+ * leaves no queue allocated, including failure to copy the queue ID back.
+ * Free the returned queue with the standard AMDGPU_USERQ_OP_FREE operation.
+ */
+struct drm_amdgpu_salkim_userq_create {
+	union drm_amdgpu_userq args;
+	__s32 relative_priority;
+	__u32 reserved;
+};
 
 #define AMDGPU_GEM_VA_BATCH_MAX_OPS	4096
 
