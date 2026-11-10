@@ -82,7 +82,7 @@ static void amdgpu_salkim_get_caps(struct drm_device *dev, struct drm_file *filp
 		caps->max_ops = AMDGPU_GEM_VA_BATCH_MAX_OPS;
 		caps->batch_features = AMDGPU_GEM_VA_BATCH_WAIT_COMPLETE |
 			AMDGPU_GEM_VA_BATCH_VM_TIMELINE |
-			AMDGPU_GEM_VA_BATCH_CLEAR;
+			AMDGPU_GEM_VA_BATCH_CLEAR | AMDGPU_GEM_VA_BATCH_MAP;
 		if (amdgpu_gem_va_batch_no_cs_wait_supported(adev, &fpriv->vm))
 			caps->batch_features |= AMDGPU_GEM_VA_BATCH_NO_CS_WAIT;
 	}
