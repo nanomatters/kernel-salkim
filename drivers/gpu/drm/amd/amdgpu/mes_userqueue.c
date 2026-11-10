@@ -148,7 +148,8 @@ static int mes_userq_map(struct amdgpu_usermode_queue *queue)
 
 	queue_input.process_context_addr = uq_mgr->proc_ctx_obj.gpu_addr;
 	queue_input.gang_context_addr = ctx->gpu_addr;
-	queue_input.inprocess_gang_priority = AMDGPU_MES_PRIORITY_LEVEL_NORMAL;
+	queue_input.inprocess_gang_priority = queue->relative_priority;
+	queue_input.raw_inprocess_priority = queue->relative_priority_set;
 	queue_input.gang_global_priority_level = convert_to_mes_priority(queue->priority);
 
 	queue_input.process_id = queue->vm->pasid;

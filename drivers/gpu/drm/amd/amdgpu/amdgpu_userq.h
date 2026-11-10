@@ -84,6 +84,8 @@ struct amdgpu_usermode_queue {
 	struct dma_fence	*last_fence;
 	u32			xcp_id;
 	int			priority;
+	int			relative_priority;
+	bool			relative_priority_set;
 	struct dentry		*debugfs_queue;
 
 	/**
@@ -167,6 +169,12 @@ struct amdgpu_usermode_queue *amdgpu_userq_get(struct amdgpu_userq_mgr *uq_mgr, 
 void amdgpu_userq_put(struct amdgpu_usermode_queue *queue);
 
 int amdgpu_userq_ioctl(struct drm_device *dev, void *data, struct drm_file *filp);
+int amdgpu_userq_create_relative(struct drm_device *dev,
+				 union drm_amdgpu_userq *args,
+				 struct drm_file *filp, int priority,
+				 struct amdgpu_usermode_queue **created_queue);
+void amdgpu_userq_create_rollback(struct drm_file *filp, u32 qid,
+				  struct amdgpu_usermode_queue *queue);
 
 int amdgpu_userq_mgr_init(struct amdgpu_userq_mgr *userq_mgr, struct drm_file *file_priv,
 			  struct amdgpu_device *adev);
@@ -182,6 +190,8 @@ void amdgpu_userq_ensure_ev_fence(struct amdgpu_userq_mgr *userq_mgr,
 				  struct amdgpu_eviction_fence_mgr *evf_mgr);
 
 u32 amdgpu_userq_get_supported_ip_mask(struct amdgpu_device *adev);
+bool amdgpu_userq_supports_relative_priority(struct amdgpu_device *adev,
+					     u32 ip_type);
 bool amdgpu_userq_enabled(struct drm_device *dev);
 
 int amdgpu_userq_suspend(struct amdgpu_device *adev);

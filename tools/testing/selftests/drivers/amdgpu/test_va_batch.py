@@ -261,6 +261,8 @@ static void *vmemdup_user(const void *src, size_t size)
 static struct amdgpu_device *drm_to_adev(struct drm_device *dev) { return dev->adev; }
 static struct drm_device *adev_to_drm(struct amdgpu_device *adev) { assert(adev == &device); return &drm; }
 static bool amdgpu_userq_enabled(struct drm_device *dev) { return dev->adev->userq; }
+static bool amdgpu_userq_supports_relative_priority(struct amdgpu_device *dev, u32 ip)
+{ return ip == AMDGPU_HW_IP_GFX || ip == AMDGPU_HW_IP_COMPUTE; }
 static struct amdgpu_bo *gem_to_amdgpu_bo(struct drm_gem_object *obj) { return (struct amdgpu_bo *)obj; }
 static struct drm_gem_object *drm_gem_object_lookup(struct drm_file *filp, u32 handle)
 {
@@ -789,7 +791,7 @@ static void query_tests(void)
             (legacy ? AMDGPU_SALKIM_CAP_BATCH_LEGACY : 0)));
         assert(caps.max_ops == (timeline ? AMDGPU_GEM_VA_BATCH_MAX_OPS : 0));
         assert(caps.relative_priority_ip_mask ==
-            0);
+            (BIT(AMDGPU_HW_IP_GFX) | BIT(AMDGPU_HW_IP_COMPUTE)));
         if (timeline) {
             assert(caps.batch_features == (AMDGPU_GEM_VA_BATCH_WAIT_COMPLETE |
                 AMDGPU_GEM_VA_BATCH_VM_TIMELINE | 0 |
