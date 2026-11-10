@@ -30,6 +30,7 @@
 #include <linux/overflow.h>
 #include <linux/pagemap.h>
 #include <linux/pci.h>
+#include <linux/sort.h>
 #include <linux/dma-buf.h>
 #include <linux/dma-fence-unwrap.h>
 #include <linux/dma-fence-array.h>
@@ -1252,6 +1253,15 @@ amdgpu_gem_va_batch_fence(struct amdgpu_vm *vm, struct xarray *bos,
 	return &array->base;
 }
 
+static int amdgpu_gem_va_batch_compare(const void *a, const void *b)
+{
+	const struct drm_amdgpu_gem_va_batch_op * const *op_a = a;
+	const struct drm_amdgpu_gem_va_batch_op * const *op_b = b;
+
+	return ((*op_a)->va_address > (*op_b)->va_address) -
+		((*op_a)->va_address < (*op_b)->va_address);
+}
+
 int amdgpu_gem_va_batch_ioctl(struct drm_device *dev, void *data,
 			    struct drm_file *filp)
 {
@@ -1261,7 +1271,7 @@ int amdgpu_gem_va_batch_ioctl(struct drm_device *dev, void *data,
 	struct amdgpu_device *adev = drm_to_adev(dev);
 	struct amdgpu_fpriv *fpriv = filp->driver_priv;
 	struct amdgpu_vm *vm = &fpriv->vm;
-	struct drm_amdgpu_gem_va_batch_op *ops;
+	struct drm_amdgpu_gem_va_batch_op **map_ops = NULL, *ops;
 	struct amdgpu_va_batch_entry *entries;
 	struct amdgpu_bo_va *bo_va;
 	struct drm_syncobj *timeline_syncobj = NULL;
@@ -1278,6 +1288,7 @@ int amdgpu_gem_va_batch_ioctl(struct drm_device *dev, void *data,
 	bool explicit_sync = args->flags & AMDGPU_GEM_VA_BATCH_WAIT_COMPLETE;
 	bool timeline = args->flags & AMDGPU_GEM_VA_BATCH_VM_TIMELINE;
 	bool clear = args->flags & AMDGPU_GEM_VA_BATCH_CLEAR;
+	bool map = args->flags & AMDGPU_GEM_VA_BATCH_MAP;
 	bool no_cs_wait = args->flags & AMDGPU_GEM_VA_BATCH_NO_CS_WAIT;
 	bool accepted = false;
 	bool flush_tlb = false;
@@ -1291,10 +1302,13 @@ int amdgpu_gem_va_batch_ioctl(struct drm_device *dev, void *data,
 	if ((args->flags & ~(AMDGPU_GEM_VA_BATCH_WAIT_COMPLETE |
 			     AMDGPU_GEM_VA_BATCH_VM_TIMELINE |
 			     AMDGPU_GEM_VA_BATCH_NO_CS_WAIT |
-			     AMDGPU_GEM_VA_BATCH_CLEAR)) ||
+			     AMDGPU_GEM_VA_BATCH_CLEAR |
+			     AMDGPU_GEM_VA_BATCH_MAP)) ||
 	    !args->count || args->count > AMDGPU_GEM_VA_BATCH_MAX_OPS)
 		return -EINVAL;
-	if (no_cs_wait && (clear || !timeline || !explicit_sync))
+	if (map && clear)
+		return -EINVAL;
+	if (no_cs_wait && (map || clear || !timeline || !explicit_sync))
 		return -EINVAL;
 	if (no_cs_wait && !amdgpu_gem_va_batch_no_cs_wait_supported(adev, vm))
 		return -EOPNOTSUPP;
@@ -1317,6 +1331,14 @@ int amdgpu_gem_va_batch_ioctl(struct drm_device *dev, void *data,
 	if (!entries) {
 		kvfree(ops);
 		return -ENOMEM;
+	}
+
+	if (map) {
+		map_ops = kvcalloc(args->count, sizeof(*map_ops), GFP_KERNEL);
+		if (!map_ops) {
+			r = -ENOMEM;
+			goto out;
+		}
 	}
 
 	if (timeline) {
@@ -1361,10 +1383,24 @@ int amdgpu_gem_va_batch_ioctl(struct drm_device *dev, void *data,
 					       op->offset_in_bo, op->map_size);
 		if (r)
 			goto out;
-		for (j = clear ? 1 : 0; j < ARRAY_SIZE(entries[i].maps); ++j) {
+		if (map)
+			map_ops[i] = op;
+		for (j = clear ? 1 : 0; j < (map ? 1 : ARRAY_SIZE(entries[i].maps)); ++j) {
 			entries[i].maps[j] = kzalloc_obj(*entries[i].maps[j]);
 			if (!entries[i].maps[j]) {
 				r = -ENOMEM;
+				goto out;
+			}
+		}
+	}
+
+	if (map) {
+		/* Check input overlaps without changing their acceptance order. */
+		sort(map_ops, args->count, sizeof(*map_ops), amdgpu_gem_va_batch_compare, NULL);
+		for (i = 1; i < args->count; ++i) {
+			if (map_ops[i - 1]->va_address + map_ops[i - 1]->map_size >
+			    map_ops[i]->va_address) {
+				r = -EINVAL;
 				goto out;
 			}
 		}
@@ -1385,7 +1421,7 @@ int amdgpu_gem_va_batch_ioctl(struct drm_device *dev, void *data,
 		drm_exec_retry_on_contention(&exec);
 		if (r)
 			goto unlock;
-		if (!timeline && !clear)
+		if (map || (!timeline && !clear))
 			continue;
 		for (i = 0; i < args->count; ++i) {
 			for (j = 0; j < 2; ++j) {
@@ -1413,6 +1449,13 @@ int amdgpu_gem_va_batch_ioctl(struct drm_device *dev, void *data,
 		r = -EBUSY;
 		goto unlock;
 	}
+	if (map) {
+		for (i = 0; i < args->count; ++i) {
+			r = amdgpu_vm_bo_map_validate(vm, ops[i].va_address, ops[i].map_size);
+			if (r)
+				goto unlock;
+		}
+	}
 	for (i = 0; !clear && i < args->count; ++i) {
 		bo_va = entries[i].obj ?
 			amdgpu_vm_bo_find(vm, gem_to_amdgpu_bo(entries[i].obj)) :
@@ -1431,7 +1474,7 @@ int amdgpu_gem_va_batch_ioctl(struct drm_device *dev, void *data,
 			goto unlock;
 	}
 
-	if (timeline || clear) {
+	if (!map && (timeline || clear)) {
 		for (i = 0; i < args->count; ++i) {
 			for (j = 0; j < 2; ++j) {
 				bo_va = amdgpu_gem_va_batch_boundary(vm, &ops[i], j);
@@ -1512,6 +1555,11 @@ int amdgpu_gem_va_batch_ioctl(struct drm_device *dev, void *data,
 				entries[i].maps[1], entries[i].maps[2], &freed,
 				explicit_sync ? &explicit_sync : NULL);
 			entries[i].maps[1] = entries[i].maps[2] = NULL;
+		} else if (map) {
+			amdgpu_vm_bo_map_prealloc(adev, entries[i].bo_va,
+				ops[i].va_address, ops[i].offset_in_bo, ops[i].map_size,
+				ops[i].flags, entries[i].maps[0]);
+			entries[i].maps[0] = NULL;
 		} else {
 			amdgpu_vm_bo_replace_map_prealloc(adev, entries[i].bo_va,
 				ops[i].va_address, ops[i].offset_in_bo, ops[i].map_size,
@@ -1528,7 +1576,7 @@ int amdgpu_gem_va_batch_ioctl(struct drm_device *dev, void *data,
 		goto unlock;
 	}
 
-	if (!clear && timeline && explicit_sync &&
+	if (!map && !clear && timeline && explicit_sync &&
 	    amdgpu_vm_skip_prt_clears(adev, vm, &bos, &freed))
 		/* A remaining clear batch already updates the TLB sequence. */
 		flush_tlb = list_empty(&freed) && list_empty(&vm->freed);
@@ -1631,6 +1679,7 @@ out:
 		if (entries[i].obj)
 			drm_gem_object_put(entries[i].obj);
 	}
+	kvfree(map_ops);
 	kvfree(entries);
 	kvfree(ops);
 	return r;
