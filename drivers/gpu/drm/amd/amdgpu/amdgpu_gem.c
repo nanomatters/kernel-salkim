@@ -1321,6 +1321,7 @@ int amdgpu_gem_va_batch_ioctl(struct drm_device *dev, void *data,
 	LIST_HEAD(freed);
 	bool explicit_sync = args->flags & AMDGPU_GEM_VA_BATCH_WAIT_COMPLETE;
 	bool timeline = args->flags & AMDGPU_GEM_VA_BATCH_VM_TIMELINE;
+	bool clear = args->flags & AMDGPU_GEM_VA_BATCH_CLEAR;
 	bool no_cs_wait = args->flags & AMDGPU_GEM_VA_BATCH_NO_CS_WAIT;
 	bool accepted = false;
 	bool flush_tlb = false;
@@ -1333,10 +1334,11 @@ int amdgpu_gem_va_batch_ioctl(struct drm_device *dev, void *data,
 
 	if ((args->flags & ~(AMDGPU_GEM_VA_BATCH_WAIT_COMPLETE |
 			     AMDGPU_GEM_VA_BATCH_VM_TIMELINE |
-			     AMDGPU_GEM_VA_BATCH_NO_CS_WAIT)) ||
+			     AMDGPU_GEM_VA_BATCH_NO_CS_WAIT |
+			     AMDGPU_GEM_VA_BATCH_CLEAR)) ||
 	    !args->count || args->count > AMDGPU_GEM_VA_BATCH_MAX_OPS)
 		return -EINVAL;
-	if (no_cs_wait && (!timeline || !explicit_sync))
+	if (no_cs_wait && (clear || !timeline || !explicit_sync))
 		return -EINVAL;
 	if (no_cs_wait && !amdgpu_gem_va_batch_no_cs_wait_supported(adev, vm))
 		return -EOPNOTSUPP;
@@ -1383,7 +1385,10 @@ int amdgpu_gem_va_batch_ioctl(struct drm_device *dev, void *data,
 		r = -EINVAL;
 		if ((op->flags & ~flags) && op->flags != AMDGPU_VM_PAGE_PRT)
 			goto out;
-		if (op->flags & AMDGPU_VM_PAGE_PRT) {
+		if (clear) {
+			if (op->handle || op->flags || op->offset_in_bo)
+				goto out;
+		} else if (op->flags & AMDGPU_VM_PAGE_PRT) {
 			if (op->handle || op->offset_in_bo)
 				goto out;
 		} else {
@@ -1406,7 +1411,7 @@ int amdgpu_gem_va_batch_ioctl(struct drm_device *dev, void *data,
 					       op->offset_in_bo, op->map_size);
 		if (r)
 			goto out;
-		for (j = 0; j < ARRAY_SIZE(entries[i].maps); ++j) {
+		for (j = clear ? 1 : 0; j < ARRAY_SIZE(entries[i].maps); ++j) {
 			entries[i].maps[j] = kzalloc_obj(*entries[i].maps[j]);
 			if (!entries[i].maps[j]) {
 				r = -ENOMEM;
@@ -1430,7 +1435,7 @@ int amdgpu_gem_va_batch_ioctl(struct drm_device *dev, void *data,
 		drm_exec_retry_on_contention(&exec);
 		if (r)
 			goto unlock;
-		if (!timeline)
+		if (!timeline && !clear)
 			continue;
 		for (i = 0; i < args->count; ++i) {
 			for (j = 0; j < 2; ++j) {
@@ -1458,7 +1463,7 @@ int amdgpu_gem_va_batch_ioctl(struct drm_device *dev, void *data,
 		r = -EBUSY;
 		goto unlock;
 	}
-	for (i = 0; i < args->count; ++i) {
+	for (i = 0; !clear && i < args->count; ++i) {
 		bo_va = entries[i].obj ?
 			amdgpu_vm_bo_find(vm, gem_to_amdgpu_bo(entries[i].obj)) :
 			fpriv->prt_va;
@@ -1476,7 +1481,7 @@ int amdgpu_gem_va_batch_ioctl(struct drm_device *dev, void *data,
 			goto unlock;
 	}
 
-	if (timeline) {
+	if (timeline || clear) {
 		for (i = 0; i < args->count; ++i) {
 			for (j = 0; j < 2; ++j) {
 				bo_va = amdgpu_gem_va_batch_boundary(vm, &ops[i], j);
@@ -1488,6 +1493,9 @@ int amdgpu_gem_va_batch_ioctl(struct drm_device *dev, void *data,
 					goto unlock;
 			}
 		}
+	}
+
+	if (timeline) {
 		xa_for_each(&bos, index, bo_va) {
 			struct amdgpu_bo *bo = bo_va->base.bo;
 
@@ -1547,11 +1555,20 @@ int amdgpu_gem_va_batch_ioctl(struct drm_device *dev, void *data,
 
 	/* This phase consumes the prepared records and cannot fail. */
 	accepted = true;
-	for (i = 0; i < args->count; ++i)
-		amdgpu_vm_bo_replace_map_prealloc(adev, entries[i].bo_va,
-			ops[i].va_address, ops[i].offset_in_bo, ops[i].map_size,
-			ops[i].flags, entries[i].maps, &freed,
-			explicit_sync ? &explicit_sync : NULL);
+	for (i = 0; i < args->count; ++i) {
+		if (clear) {
+			amdgpu_vm_bo_clear_mappings_prealloc(adev, vm,
+				ops[i].va_address, ops[i].map_size,
+				entries[i].maps[1], entries[i].maps[2], &freed,
+				explicit_sync ? &explicit_sync : NULL);
+			entries[i].maps[1] = entries[i].maps[2] = NULL;
+		} else {
+			amdgpu_vm_bo_replace_map_prealloc(adev, entries[i].bo_va,
+				ops[i].va_address, ops[i].offset_in_bo, ops[i].map_size,
+				ops[i].flags, entries[i].maps, &freed,
+				explicit_sync ? &explicit_sync : NULL);
+		}
+	}
 	if (!explicit_sync)
 		list_splice_init(&freed, &vm->freed);
 
@@ -1561,7 +1578,7 @@ int amdgpu_gem_va_batch_ioctl(struct drm_device *dev, void *data,
 		goto unlock;
 	}
 
-	if (timeline && explicit_sync &&
+	if (!clear && timeline && explicit_sync &&
 	    amdgpu_vm_skip_prt_clears(adev, vm, &bos, &freed))
 		/* A remaining clear batch already updates the TLB sequence. */
 		flush_tlb = list_empty(&freed) && list_empty(&vm->freed);
