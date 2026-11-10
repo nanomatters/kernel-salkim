@@ -94,7 +94,13 @@ struct drm_amdgpu_salkim_userq_create {
  */
 #define AMDGPU_GEM_VA_BATCH_CLEAR		(1U << 3)
 
-/* Operations run in array order: CLEAR when requested, otherwise REPLACE.
+/* Insert mappings only into empty ranges. Existing mappings and overlapping
+ * operations reject the entire batch. Cannot be combined with CLEAR or
+ * NO_CS_WAIT.
+ */
+#define AMDGPU_GEM_VA_BATCH_MAP		(1U << 4)
+
+/* Operations run in array order: MAP or CLEAR when requested, else REPLACE.
  * REPLACE with PRT and handle 0 unbinds a range.
  * DELAY_UPDATE is not accepted; the kernel manages pending updates.
  */

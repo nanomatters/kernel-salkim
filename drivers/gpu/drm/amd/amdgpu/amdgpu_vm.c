@@ -2139,6 +2139,28 @@ int amdgpu_vm_verify_parameters(struct amdgpu_device *adev,
 	return 0;
 }
 
+/* The range was validated and the VM remains reserved through insertion. */
+int amdgpu_vm_bo_map_validate(struct amdgpu_vm *vm, uint64_t saddr, uint64_t size)
+{
+	uint64_t start = saddr / AMDGPU_GPU_PAGE_SIZE;
+	uint64_t last = start + (size - 1) / AMDGPU_GPU_PAGE_SIZE;
+
+	amdgpu_vm_assert_locked(vm);
+	return amdgpu_vm_it_iter_first(&vm->va, start, last) ? -EINVAL : 0;
+}
+
+/* Insert a prepared record after validating the range and overlap under lock. */
+void amdgpu_vm_bo_map_prealloc(struct amdgpu_device *adev,
+		struct amdgpu_bo_va *bo_va, uint64_t saddr, uint64_t offset,
+		uint64_t size, uint32_t flags, struct amdgpu_bo_va_mapping *mapping)
+{
+	mapping->start = saddr / AMDGPU_GPU_PAGE_SIZE;
+	mapping->last = mapping->start + (size - 1) / AMDGPU_GPU_PAGE_SIZE;
+	mapping->offset = offset;
+	mapping->flags = flags;
+	amdgpu_vm_bo_insert_map(adev, bo_va, mapping);
+}
+
 /**
  * amdgpu_vm_bo_map - map bo inside a vm
  *
