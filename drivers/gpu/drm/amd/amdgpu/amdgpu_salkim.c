@@ -7,6 +7,7 @@
 
 #include "amdgpu.h"
 #include "amdgpu_salkim.h"
+#include "amdgpu_userq.h"
 
 #define AMDGPU_SALKIM_MAX_PAYLOAD 4096
 
@@ -22,6 +23,9 @@ static_assert(offsetof(struct drm_amdgpu_gem_va_batch, reserved) == 16);
 static_assert(sizeof(struct drm_amdgpu_gem_va_batch_op) == 32);
 static_assert(sizeof(struct drm_amdgpu_gem_va) == 64);
 static_assert(offsetof(struct drm_amdgpu_gem_va, vm_timeline_point) == 40);
+static_assert(sizeof(union drm_amdgpu_userq) == 72);
+static_assert(sizeof(struct drm_amdgpu_salkim_userq_create) == 80);
+static_assert(offsetof(struct drm_amdgpu_salkim_userq_create, relative_priority) == 72);
 
 static int amdgpu_salkim_validate_request(const struct drm_amdgpu_salkim_request *request)
 {
@@ -42,6 +46,9 @@ static int amdgpu_salkim_validate_request(const struct drm_amdgpu_salkim_request
 	case AMDGPU_SALKIM_OP_UNMAP:
 		minimum = sizeof(struct drm_amdgpu_gem_va);
 		break;
+	case AMDGPU_SALKIM_OP_USERQ_CREATE:
+		minimum = sizeof(struct drm_amdgpu_salkim_userq_create);
+		break;
 	default:
 		return -ENOTTY;
 	}
@@ -58,6 +65,7 @@ static void amdgpu_salkim_get_caps(struct drm_device *dev, struct drm_file *filp
 {
 	struct amdgpu_device *adev = drm_to_adev(dev);
 	struct amdgpu_fpriv *fpriv = filp->driver_priv;
+	u32 ip;
 
 	*caps = (struct drm_amdgpu_salkim_caps) {
 		.magic = AMDGPU_SALKIM_MAGIC,
@@ -76,6 +84,10 @@ static void amdgpu_salkim_get_caps(struct drm_device *dev, struct drm_file *filp
 			AMDGPU_GEM_VA_BATCH_VM_TIMELINE;
 		if (amdgpu_gem_va_batch_no_cs_wait_supported(adev, &fpriv->vm))
 			caps->batch_features |= AMDGPU_GEM_VA_BATCH_NO_CS_WAIT;
+	}
+	for (ip = 0; ip < AMDGPU_HW_IP_NUM; ++ip) {
+		if (amdgpu_userq_supports_relative_priority(adev, ip))
+			caps->relative_priority_ip_mask |= BIT(ip);
 	}
 }
 
@@ -112,6 +124,27 @@ static int amdgpu_salkim_ioctl(struct drm_device *dev, void *data,
 		if (r)
 			return r;
 		return amdgpu_gem_va_unmap_ioctl(dev, &args, filp);
+	}
+	case AMDGPU_SALKIM_OP_USERQ_CREATE: {
+		struct drm_amdgpu_salkim_userq_create args;
+		struct amdgpu_usermode_queue *queue;
+
+		r = copy_struct_from_user(&args, sizeof(args), payload, request->payload_size);
+		if (r)
+			return r;
+		if (args.reserved)
+			return -EINVAL;
+		r = amdgpu_userq_create_relative(dev, &args.args, filp,
+						 args.relative_priority, &queue);
+		if (r)
+			return r;
+		if (copy_to_user(payload, &args, sizeof(args))) {
+			/* Never remove a replacement queue after concurrent ID reuse. */
+			amdgpu_userq_create_rollback(filp, args.args.out.queue_id, queue);
+			r = -EFAULT;
+		}
+		amdgpu_userq_put(queue);
+		return r;
 	}
 	default:
 		return -ENOTTY;

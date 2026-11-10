@@ -289,6 +289,8 @@ struct mes_add_queue_input {
 	uint64_t	gang_context_addr;
 	uint32_t	inprocess_gang_priority;
 	uint32_t	gang_global_priority_level;
+	/* Raw signed UserQ priority, rather than the legacy KFD enum. */
+	bool		raw_inprocess_priority;
 	uint32_t	doorbell_offset;
 	uint64_t	mqd_addr;
 	uint64_t	wptr_addr;
@@ -462,6 +464,8 @@ struct mes_change_gang_priority_input {
 	u64 gang_quantum;
 	u32 gang_context_array_index;
 	u32 gang_global_priority_level;
+	s32 inprocess_gang_priority;
+	bool raw_inprocess_priority;
 };
 
 struct amdgpu_mes_funcs {
