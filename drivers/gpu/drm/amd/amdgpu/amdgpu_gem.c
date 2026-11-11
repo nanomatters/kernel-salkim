@@ -880,8 +880,7 @@ out:
 	return amdgpu_gem_va_update_fence(vm, bo_va, operation, survivors);
 }
 
-int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
-			  struct drm_file *filp)
+static bool amdgpu_gem_va_flags_valid(u32 operation, u32 flags)
 {
 	const uint32_t valid_flags = AMDGPU_VM_DELAY_UPDATE |
 		AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_WRITEABLE |
@@ -890,6 +889,12 @@ int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
 	const uint32_t prt_flags = AMDGPU_VM_DELAY_UPDATE |
 		AMDGPU_VM_PAGE_PRT;
 
+	return !(flags & ~valid_flags) || !(flags & ~prt_flags);
+}
+
+static int amdgpu_gem_va_ioctl_internal(struct drm_device *dev, void *data,
+					struct drm_file *filp, bool explicit_unmap)
+{
 	struct drm_amdgpu_gem_va *args = data;
 	struct drm_gem_object *gobj;
 	struct amdgpu_device *adev = drm_to_adev(dev);
@@ -939,7 +944,7 @@ int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
 		return -EINVAL;
 	}
 
-	if ((args->flags & ~valid_flags) && (args->flags & ~prt_flags)) {
+	if (!amdgpu_gem_va_flags_valid(args->operation, args->flags)) {
 		dev_dbg(dev->dev, "invalid flags combination 0x%08X\n",
 			args->flags);
 		return -EINVAL;
@@ -1052,7 +1057,8 @@ int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
 				     args->flags);
 		break;
 	case AMDGPU_VA_OP_UNMAP:
-		r = amdgpu_vm_bo_unmap(adev, bo_va, args->va_address);
+		r = amdgpu_vm_bo_unmap(adev, bo_va, args->va_address,
+				       explicit_unmap);
 		break;
 
 	case AMDGPU_VA_OP_CLEAR:
@@ -1106,6 +1112,24 @@ error:
 error_put_gobj:
 	drm_gem_object_put(gobj);
 	return r;
+}
+
+int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
+			struct drm_file *filp)
+{
+	return amdgpu_gem_va_ioctl_internal(dev, data, filp, false);
+}
+
+int amdgpu_gem_va_unmap_ioctl(struct drm_device *dev, void *data,
+			      struct drm_file *filp)
+{
+	struct drm_amdgpu_gem_va *args = data;
+
+	if (args->_pad || args->operation != AMDGPU_VA_OP_UNMAP ||
+	    args->flags & ~AMDGPU_VM_DELAY_UPDATE)
+		return -EINVAL;
+
+	return amdgpu_gem_va_ioctl_internal(dev, data, filp, true);
 }
 
 /* Only the legacy mode relies on subsequent kernel command submission. */
@@ -1579,7 +1603,8 @@ int amdgpu_gem_va_batch_ioctl(struct drm_device *dev, void *data,
 	if (!map && !clear && timeline && explicit_sync &&
 	    amdgpu_vm_skip_prt_clears(adev, vm, &bos, &freed))
 		/* A remaining clear batch already updates the TLB sequence. */
-		flush_tlb = list_empty(&freed) && list_empty(&vm->freed);
+		flush_tlb = list_empty(&freed) && list_empty(&vm->freed) &&
+			    list_empty(&vm->freed_explicit);
 
 	/* Reuse existing batching, reservation dependencies and invalidation. */
 	r = amdgpu_vm_clear_freed(adev, vm, &vm->last_update);
