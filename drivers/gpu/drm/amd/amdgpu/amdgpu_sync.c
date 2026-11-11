@@ -185,6 +185,11 @@ static bool amdgpu_sync_test_fence(struct amdgpu_device *adev,
 {
 	void *fence_owner = amdgpu_sync_get_owner(f);
 
+	/* Only explicit UNMAP opts out of UserQ rendering dependencies. */
+	if (mode == AMDGPU_SYNC_EXPLICIT_UNMAP &&
+	    amdgpu_userq_fence_is_same_device(adev, f))
+		return false;
+
 	/* Always sync to moves, no matter what */
 	if (fence_owner == AMDGPU_FENCE_OWNER_UNDEFINED)
 		return true;
@@ -220,6 +225,7 @@ static bool amdgpu_sync_test_fence(struct amdgpu_device *adev,
 		break;
 
 	case AMDGPU_SYNC_EXPLICIT:
+	case AMDGPU_SYNC_EXPLICIT_UNMAP:
 		return false;
 	}
 

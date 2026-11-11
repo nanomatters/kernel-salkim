@@ -326,6 +326,8 @@ struct amdgpu_vm {
 	 * but not updated in the PTs
 	 */
 	struct list_head	freed;
+	/* Retired mappings whose accesses were completed by userspace. */
+	struct list_head	freed_explicit;
 
 	/* contains the page directory */
 	struct amdgpu_vm_bo_base     root;
@@ -523,7 +525,7 @@ void amdgpu_vm_bo_replace_map_prealloc(struct amdgpu_device *adev,
 		struct list_head *freed, bool *explicit_sync);
 int amdgpu_vm_bo_unmap(struct amdgpu_device *adev,
 		       struct amdgpu_bo_va *bo_va,
-		       uint64_t addr);
+		       u64 addr, bool explicit_sync);
 int amdgpu_vm_bo_clear_mappings(struct amdgpu_device *adev,
 				struct amdgpu_vm *vm,
 				uint64_t saddr, uint64_t size);
