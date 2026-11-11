@@ -1401,7 +1401,11 @@ retry_lock:
 				goto unlock_all;
 			}
 
-			xa_store(&xa, key, range, GFP_KERNEL);
+			ret = xa_err(xa_store(&xa, key, range, GFP_KERNEL));
+			if (ret) {
+				amdgpu_hmm_range_free(range);
+				goto unlock_all;
+			}
 			new_addition = true;
 		}
 		key++;

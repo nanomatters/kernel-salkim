@@ -154,6 +154,10 @@ static unsigned restored, updates, unlocks;
 static uint64_t bo_mc_base;
 static unsigned trace_count, restore_depth, restore_begin, restore_end;
 static int restore_result;
+static unsigned range_alloc_calls, ranges_allocated, ranges_freed, store_calls, user_pages_calls;
+static unsigned fail_range_allocation;
+static long fail_store_index;
+static int user_pages_error;
 static bool trace_enabled;
 static struct amdgpu_bo_va_mapping *trace_mappings[8];
 static bool trace_amdgpu_vm_bo_clear_enabled(void) { return trace_enabled; }
@@ -230,7 +234,12 @@ static void drm_exec_fini(struct drm_exec *exec)
     if (target_resv.owner == &exec->ticket)
         target_resv.owner = NULL;
 }
-static int amdgpu_vm_lock_pd(struct amdgpu_vm *vm, struct drm_exec *exec, unsigned count) { return 0; }
+static int amdgpu_vm_lock_pd(struct amdgpu_vm *vm, struct drm_exec *exec, unsigned count)
+{
+    if (!list_empty(&vm->always_valid.idle))
+        target_resv.owner = &exec->ticket;
+    return 0;
+}
 static int amdgpu_vm_lock_individual(struct amdgpu_vm *vm, struct drm_exec *exec, unsigned count)
 {
     if (!list_empty(&vm->individual.idle)) {
@@ -267,12 +276,38 @@ static int ttm_bo_validate(struct ttm_buffer_object *bo, void *placement, struct
     return 0;
 }
 static void amdgpu_ttm_tt_set_user_pages(struct ttm_tt *ttm, struct amdgpu_hmm_range *range) { }
-static int amdgpu_ttm_tt_get_user_pages(struct amdgpu_bo *bo, struct amdgpu_hmm_range *range) { return 0; }
-static struct amdgpu_hmm_range *amdgpu_hmm_range_alloc(struct amdgpu_bo *bo) { return calloc(1, sizeof(struct amdgpu_hmm_range)); }
-static void amdgpu_hmm_range_free(struct amdgpu_hmm_range *range) { free(range); }
+static int amdgpu_ttm_tt_get_user_pages(struct amdgpu_bo *bo, struct amdgpu_hmm_range *range)
+{ user_pages_calls++; return user_pages_error; }
+static struct amdgpu_hmm_range *amdgpu_hmm_range_alloc(struct amdgpu_bo *bo)
+{
+    if (++range_alloc_calls == fail_range_allocation)
+        return NULL;
+    struct amdgpu_hmm_range *range = calloc(1, sizeof(*range));
+    assert(range);
+    range->bo = amdgpu_bo_ref(bo);
+    ranges_allocated++;
+    return range;
+}
+static void amdgpu_hmm_range_free(struct amdgpu_hmm_range *range)
+{
+    ranges_freed++;
+    amdgpu_bo_unref(&range->bo);
+    free(range);
+}
 static void xa_init(struct xarray *array) { *array = (struct xarray){0}; }
 static void *xa_load(struct xarray *array, unsigned long key) { assert(key < 4); return array->values[key]; }
-static void xa_store(struct xarray *array, unsigned long key, void *value, unsigned flags) { assert(key < 4); array->values[key] = value; }
+static void *xa_store(struct xarray *array, unsigned long key, void *value, unsigned flags)
+{
+    assert(key < 4);
+    store_calls++;
+    if ((long)key == fail_store_index) {
+        fail_store_index = -1;
+        return (void *)(intptr_t)-ENOMEM;
+    }
+    array->values[key] = value;
+    return NULL;
+}
+#define xa_err(entry) ((int)(intptr_t)(entry))
 static void xa_erase(struct xarray *array, unsigned long key) { assert(key < 4); array->values[key] = NULL; }
 static void xa_destroy(struct xarray *array) { }
 static int amdgpu_userq_validate_vm(void *data, struct amdgpu_bo *bo) { return 0; }
@@ -324,6 +359,10 @@ static void setup(void)
     trace_count = restore_begin = restore_end = 0;
     trace_enabled = false;
     restore_result = 0;
+    range_alloc_calls = ranges_allocated = ranges_freed = store_calls = user_pages_calls = 0;
+    fail_range_allocation = 0;
+    fail_store_index = -1;
+    user_pages_error = 0;
 }
 
 int main(void)
@@ -429,6 +468,33 @@ int main(void)
     setup();
     assert(amdgpu_userq_vm_validate_and_restore_queue(&fpriv.userq_mgr) == 0);
     assert(restore_begin == 1 && restore_end == 1 && !restore_result);
+    for (unsigned mode = 0; mode < 5; mode++) {
+        setup();
+        target_tt.userptr = true;
+        list_move(&target_va.base.vm_status, &fpriv.vm.always_valid.idle);
+        struct amdgpu_bo second_bo = target_bo;
+        struct amdgpu_bo_va second_va = {.base = {.bo = &second_bo, .vm = &fpriv.vm}, .vm = &fpriv.vm};
+        if (mode != 0)
+            list_add(&second_va.base.vm_status, &target_va.base.vm_status);
+        /* Index 0 needs no XArray node. Index 1 can fail allocating one. */
+        if (mode == 2)
+            fail_store_index = 1;
+        else if (mode == 3)
+            fail_range_allocation = 2;
+        else if (mode == 4)
+            user_pages_error = -EFAULT;
+        int expected = mode == 4 ? -EFAULT : mode >= 2 ? -ENOMEM : 0;
+        assert(amdgpu_userq_vm_validate_and_restore_queue(&fpriv.userq_mgr) == expected);
+        assert(restored == (expected == 0));
+        assert(ranges_allocated == ranges_freed);
+        assert(target_bo.refs == 1 && second_bo.refs == 1 && !target_resv.owner);
+        assert(restore_begin == 1 && restore_end == 1 && restore_result == expected);
+        if (mode == 2)
+            assert(store_calls == 2 && ranges_allocated == 2 && !user_pages_calls);
+        if (mode == 3)
+            assert(store_calls == 1 && ranges_allocated == 1 && !user_pages_calls);
+    }
+    puts("UserQ restore: userptr success, allocation failures and page-acquisition cleanup passed");
     puts("UserQ restore: 13 reservation cases and clear/restore diagnostics passed");
     return 0;
 }
