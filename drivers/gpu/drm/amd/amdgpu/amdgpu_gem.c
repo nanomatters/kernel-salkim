@@ -336,7 +336,7 @@ static void amdgpu_gem_object_close(struct drm_gem_object *obj,
 
 	drm_exec_init(&exec, DRM_EXEC_IGNORE_DUPLICATES, 0);
 	drm_exec_until_all_locked(&exec) {
-		r = drm_exec_prepare_obj(&exec, &bo->tbo.base, 1);
+		r = drm_exec_prepare_obj(&exec, &bo->tbo.base, 2);
 		drm_exec_retry_on_contention(&exec);
 		if (unlikely(r))
 			goto out_unlock;
@@ -360,17 +360,19 @@ static void amdgpu_gem_object_close(struct drm_gem_object *obj,
 	amdgpu_vm_bo_del(adev, bo_va);
 	amdgpu_vm_bo_update_shared(bo);
 	if (!amdgpu_vm_ready(vm))
-		goto out_unlock;
+		goto out_fence;
 
 	r = amdgpu_vm_clear_freed(adev, vm, &fence);
 	if (unlikely(r < 0) && !drm_dev_is_unplugged(adev_to_drm(adev)))
 		dev_err(adev->dev, "failed to clear page "
 			"tables on GEM object close (%ld)\n", r);
-	if (r || !fence)
-		goto out_unlock;
-
-	amdgpu_bo_fence(bo, fence, true);
-	dma_fence_put(fence);
+	if (fence) {
+		amdgpu_bo_fence(bo, fence, true);
+		dma_fence_put(fence);
+	}
+out_fence:
+	/* A prior unmap can still be invalidating translations on close. */
+	amdgpu_bo_fence(bo, vm->last_tlb_inv, true);
 
 out_unlock:
 	if (r && !drm_dev_is_unplugged(adev_to_drm(adev)))
