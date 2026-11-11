@@ -162,7 +162,7 @@ struct amdgpu_vm {
     bool use_cpu_for_update, is_compute_context, need_tlb_fence, ready;
     struct { struct amdgpu_bo *bo; } root;
     struct dma_fence *last_update, *last_tlb_inv;
-    struct list_head freed;
+    struct list_head freed, freed_explicit;
     struct amdgpu_vm_batch_state *batch_state;
     u64 tlb_seq;
 };

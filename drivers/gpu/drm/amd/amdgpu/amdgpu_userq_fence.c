@@ -44,6 +44,14 @@ static inline struct amdgpu_userq_fence *to_amdgpu_userq_fence(struct dma_fence 
 	return container_of(f, struct amdgpu_userq_fence, base);
 }
 
+bool amdgpu_userq_fence_is_same_device(struct amdgpu_device *adev,
+				       struct dma_fence *f)
+{
+	struct amdgpu_userq_fence *fence = to_amdgpu_userq_fence(f);
+
+	return fence && fence->fence_drv->adev == adev;
+}
+
 static u64 amdgpu_userq_fence_read(struct amdgpu_userq_fence_driver *fence_drv)
 {
 	return le64_to_cpu(READ_ONCE(*fence_drv->cpu_addr));

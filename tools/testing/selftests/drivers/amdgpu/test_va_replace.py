@@ -17,10 +17,10 @@ class VaReplaceTests(unittest.TestCase):
     def test_surviving_mappings_and_completion(self):
         source = (AMD / 'amdgpu_gem.c').read_text()
         names = ('amdgpu_gem_va_batch_boundary', 'amdgpu_gem_va_update_fence',
-                 'amdgpu_gem_va_update_vm', 'amdgpu_gem_va_ioctl')
+                 'amdgpu_gem_va_update_vm', 'amdgpu_gem_va_flags_valid', 'amdgpu_gem_va_ioctl')
         functions = []
         for name in names:
-            match = re.search(r'^(?:static )?(?:int|struct \w+ \*)\s*' + name
+            match = re.search(r'^(?:static )?(?:int|bool|struct \w+ \*)\s*' + name
                               + r'\(.*?^\}', source, re.M | re.S)
             self.assertIsNotNone(match, name)
             functions.append(match.group())
@@ -94,7 +94,7 @@ static struct dma_fence fences[6], merged, stub;
 static bool pd_locked, mutated, merge_fail, vm_ready;
 static unsigned cases, lookups, maps, published, published_mask, clear_updates, pde_updates;
 static unsigned lock_calls, contended_id, lock_error_id, update_error_id;
-static bool bad_syncobj;
+static bool bad_syncobj, unmap_explicit;
 #define drm_exec_until_all_locked(e) \
     for (; drm_exec_cleanup(e);) if (false) { retry: continue; } else
 #define drm_exec_retry_on_contention(e) do { if ((e)->contended) goto retry; } while (0)
@@ -217,8 +217,8 @@ static int amdgpu_vm_update_pdes(struct amdgpu_device *dev, struct amdgpu_vm *vm
 static int amdgpu_vm_bo_map(struct amdgpu_device *dev, struct amdgpu_bo_va *va,
                             u64 address, u64 offset, u64 size, uint32_t flags)
 { assert(pd_locked); mutated = true; return 0; }
-static int amdgpu_vm_bo_unmap(struct amdgpu_device *dev, struct amdgpu_bo_va *va, u64 address)
-{ assert(pd_locked); mutated = true; return 0; }
+static int amdgpu_vm_bo_unmap(struct amdgpu_device *dev, struct amdgpu_bo_va *va, u64 address, bool explicit_sync)
+{ assert(pd_locked); mutated = true; unmap_explicit = explicit_sync; return 0; }
 static int amdgpu_vm_bo_clear_mappings(struct amdgpu_device *dev, struct amdgpu_vm *vm,
                                        u64 address, u64 size)
 { assert(pd_locked); mutated = true; return 0; }
@@ -260,7 +260,7 @@ static struct drm_amdgpu_gem_va reset(void)
     private.prt_va = &vas[3];
     mappings[0] = (struct amdgpu_bo_va_mapping){16, 31, &vas[1]};
     maps = 1;
-    mutated = pd_locked = merge_fail = bad_syncobj = false;
+    mutated = pd_locked = merge_fail = bad_syncobj = unmap_explicit = false;
     vm_ready = true;
     lookups = published = published_mask = clear_updates = pde_updates = lock_calls = 0;
     contended_id = lock_error_id = update_error_id = 99;
@@ -284,6 +284,31 @@ static int invoke(struct drm_amdgpu_gem_va *args)
 }
 int main(void)
 {
+    for (unsigned explicit_sync = 0; explicit_sync < 2; ++explicit_sync) {
+        struct drm_amdgpu_gem_va a = reset();
+        a.operation = AMDGPU_VA_OP_UNMAP;
+        a.flags = explicit_sync ? AMDGPU_VM_UNMAP_EXPLICIT_SYNC : 0;
+        assert(!invoke(&a) && mutated && unmap_explicit == !!explicit_sync);
+        assert(published == 1 && (published_mask & 3) == 3 && !lookups);
+        a = reset(); a.operation = AMDGPU_VA_OP_UNMAP;
+        a.flags = AMDGPU_VM_DELAY_UPDATE | (explicit_sync ? AMDGPU_VM_UNMAP_EXPLICIT_SYNC : 0);
+        a.vm_timeline_syncobj_out = 0;
+        assert(!invoke(&a) && mutated && unmap_explicit == !!explicit_sync);
+        assert(!clear_updates && !pde_updates && !published);
+    }
+    for (unsigned operation = AMDGPU_VA_OP_MAP; operation <= AMDGPU_VA_OP_REPLACE; ++operation) {
+        if (operation == AMDGPU_VA_OP_UNMAP) continue;
+        struct drm_amdgpu_gem_va a = reset();
+        a.operation = operation; a.flags = AMDGPU_VM_UNMAP_EXPLICIT_SYNC;
+        assert(invoke(&a) == -EINVAL && !mutated && !lock_calls);
+    }
+    {
+        struct drm_amdgpu_gem_va a = reset();
+        a.operation = AMDGPU_VA_OP_UNMAP;
+        a.flags = AMDGPU_VM_UNMAP_EXPLICIT_SYNC | AMDGPU_VM_PAGE_READABLE;
+        assert(invoke(&a) == -EINVAL && !mutated && !lock_calls);
+    }
+
     for (unsigned clear = 0; clear < 2; ++clear) {
         for (unsigned prt = 0; prt < 2; ++prt) {
             for (unsigned split = 0; split < 2; ++split) {

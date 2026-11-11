@@ -974,6 +974,15 @@ struct drm_amdgpu_gem_list_handles_entry {
 /* Delay the page table update till the next CS */
 #define AMDGPU_VM_DELAY_UPDATE		(1 << 0)
 
+/*
+ * UNMAP only: userspace has completed every access through this VA mapping.
+ * Skip rendering dependencies for its retirement, but retain memory movement,
+ * page-table update and TLB invalidation ordering. Can be combined only with
+ * AMDGPU_VM_DELAY_UPDATE. This does not make the unmap complete synchronously.
+ * Query AMDGPU_IDS_FLAGS_VM_UNMAP_EXPLICIT_SYNC before using this flag.
+ */
+#define AMDGPU_VM_UNMAP_EXPLICIT_SYNC	(1 << 10)
+
 /* Mapping flags */
 /* readable mapping */
 #define AMDGPU_VM_PAGE_READABLE		(1 << 1)
@@ -1191,6 +1200,7 @@ struct drm_amdgpu_cs_chunk_cp_gfx_shadow {
 #define AMDGPU_IDS_FLAGS_TMZ			0x04
 #define AMDGPU_IDS_FLAGS_CONFORMANT_TRUNC_COORD	0x08
 #define AMDGPU_IDS_FLAGS_GANG_SUBMIT		0x10
+#define AMDGPU_IDS_FLAGS_VM_UNMAP_EXPLICIT_SYNC	0x20
 
 /*
  *  Query h/w info: Flag identifying VF/PF/PT mode

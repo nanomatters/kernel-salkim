@@ -1297,7 +1297,7 @@ static int unmap_bo_from_gpuvm(struct kgd_mem *mem,
 		return -EBUSY;
 	}
 
-	(void)amdgpu_vm_bo_unmap(adev, bo_va, entry->va);
+	(void)amdgpu_vm_bo_unmap(adev, bo_va, entry->va, false);
 
 	/* VM entity stopped if process killed, don't clear freed pt bo */
 	if (!amdgpu_vm_ready(vm))

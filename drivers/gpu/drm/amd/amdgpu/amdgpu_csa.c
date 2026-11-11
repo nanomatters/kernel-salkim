@@ -124,7 +124,7 @@ int amdgpu_unmap_static_csa(struct amdgpu_device *adev, struct amdgpu_vm *vm,
 		}
 	}
 
-	r = amdgpu_vm_bo_unmap(adev, bo_va, csa_addr);
+	r = amdgpu_vm_bo_unmap(adev, bo_va, csa_addr, false);
 	if (r) {
 		drm_err(adev_to_drm(adev),
 			"failed to do bo_unmap on static CSA, err=%d\n", r);

@@ -893,8 +893,7 @@ out:
 	return amdgpu_gem_va_update_fence(vm, bo_va, operation, survivors);
 }
 
-int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
-			  struct drm_file *filp)
+static bool amdgpu_gem_va_flags_valid(u32 operation, u32 flags)
 {
 	const uint32_t valid_flags = AMDGPU_VM_DELAY_UPDATE |
 		AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_WRITEABLE |
@@ -903,6 +902,17 @@ int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
 	const uint32_t prt_flags = AMDGPU_VM_DELAY_UPDATE |
 		AMDGPU_VM_PAGE_PRT;
 
+	if (flags & AMDGPU_VM_UNMAP_EXPLICIT_SYNC)
+		return operation == AMDGPU_VA_OP_UNMAP &&
+			!(flags & ~(AMDGPU_VM_UNMAP_EXPLICIT_SYNC |
+				     AMDGPU_VM_DELAY_UPDATE));
+
+	return !(flags & ~valid_flags) || !(flags & ~prt_flags);
+}
+
+int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
+			struct drm_file *filp)
+{
 	struct drm_amdgpu_gem_va *args = data;
 	struct drm_gem_object *gobj;
 	struct amdgpu_device *adev = drm_to_adev(dev);
@@ -952,7 +962,7 @@ int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
 		return -EINVAL;
 	}
 
-	if ((args->flags & ~valid_flags) && (args->flags & ~prt_flags)) {
+	if (!amdgpu_gem_va_flags_valid(args->operation, args->flags)) {
 		dev_dbg(dev->dev, "invalid flags combination 0x%08X\n",
 			args->flags);
 		return -EINVAL;
@@ -1070,7 +1080,8 @@ int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
 				     args->flags);
 		break;
 	case AMDGPU_VA_OP_UNMAP:
-		r = amdgpu_vm_bo_unmap(adev, bo_va, args->va_address);
+		r = amdgpu_vm_bo_unmap(adev, bo_va, args->va_address,
+				       args->flags & AMDGPU_VM_UNMAP_EXPLICIT_SYNC);
 		break;
 
 	case AMDGPU_VA_OP_CLEAR:
