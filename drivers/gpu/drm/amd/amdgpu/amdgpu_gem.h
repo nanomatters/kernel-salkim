@@ -65,6 +65,8 @@ int amdgpu_gem_wait_idle_ioctl(struct drm_device *dev, void *data,
 			      struct drm_file *filp);
 int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
 			  struct drm_file *filp);
+int amdgpu_gem_va_unmap_ioctl(struct drm_device *dev, void *data,
+			      struct drm_file *filp);
 bool amdgpu_gem_va_batch_supported(struct amdgpu_device *adev,
 				   struct amdgpu_vm *vm, bool timeline);
 bool amdgpu_gem_va_batch_no_cs_wait_supported(struct amdgpu_device *adev,

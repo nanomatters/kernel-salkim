@@ -196,6 +196,12 @@ static int amdgpu_gem_va_batch_ioctl(struct drm_device *dev, void *data, struct 
     ++batch_calls;
     return backend_result;
 }
+static int amdgpu_gem_va_unmap_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
+{
+    ++unmap_calls;
+    assert(((struct drm_amdgpu_gem_va *)data)->operation == AMDGPU_VA_OP_UNMAP);
+    return backend_result;
+}
 
 struct amdgpu_usermode_queue { unsigned refs; };
 static struct amdgpu_usermode_queue created;
@@ -256,9 +262,11 @@ int main(void)
         unsigned char bytes[4096];
         struct drm_amdgpu_salkim_caps caps;
         struct drm_amdgpu_gem_va_batch batch;
+        struct drm_amdgpu_gem_va unmap;
         struct drm_amdgpu_salkim_userq_create create;
     } payload = {0};
-    const unsigned sizes[] = {0, sizeof(payload.caps), sizeof(payload.batch), 0, sizeof(payload.create)};
+    const unsigned sizes[] = {0, sizeof(payload.caps), sizeof(payload.batch),
+                             sizeof(payload.unmap), sizeof(payload.create)};
     struct drm_amdgpu_salkim_request req = {.magic = AMDGPU_SALKIM_MAGIC,
         .abi = AMDGPU_SALKIM_ABI, .op = AMDGPU_SALKIM_OP_CAPS,
         .payload = (uintptr_t)&payload, .payload_size = sizeof(payload.caps)};
@@ -276,11 +284,6 @@ int main(void)
     assert(amdgpu_salkim_ioctl(&dev, &req, &filp) == -EINVAL);
     no_backend(); assert(!copies_in && !copies_out);
     for (unsigned op = 1; op <= 4; ++op) {
-        if (!sizes[op]) {
-            req = good; req.op = op;
-            assert(amdgpu_salkim_ioctl(&dev, &req, &filp) == -ENOTTY);
-            continue;
-        }
         req = good; req.op = op;
         for (unsigned size = 0; size < sizes[op]; ++size) {
             req.payload_size = size;
@@ -314,9 +317,9 @@ int main(void)
     assert(!amdgpu_salkim_ioctl(&dev, &req, &filp));
     for (unsigned i = sizeof(payload.caps); i < sizeof(payload); ++i) assert(!payload.bytes[i]);
     for (unsigned op = 2; op <= 4; ++op) {
-        if (!sizes[op]) continue;
         reset_counters(); memset(&payload, 0, sizeof(payload));
         req = good; req.op = op; req.payload_size = sizes[op];
+        if (op == 3) payload.unmap.operation = AMDGPU_VA_OP_UNMAP;
         if (op == 4) payload.create.args.in.op = AMDGPU_USERQ_OP_CREATE;
         fail_in = true;
         assert(amdgpu_salkim_ioctl(&dev, &req, &filp) == -EFAULT);

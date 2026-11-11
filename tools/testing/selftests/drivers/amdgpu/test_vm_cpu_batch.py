@@ -110,7 +110,7 @@ typedef uint64_t dma_addr_t;
 #define trace_amdgpu_vm_set_ptes(...) ((void)0)
 #define atomic64_inc(p) (++*(p))
 
-enum amdgpu_sync_mode { AMDGPU_SYNC_EXPLICIT, AMDGPU_SYNC_EQ_OWNER };
+enum amdgpu_sync_mode { AMDGPU_SYNC_EXPLICIT, AMDGPU_SYNC_EQ_OWNER, AMDGPU_SYNC_EXPLICIT_UNMAP };
 struct list_head { struct list_head *next, *prev; };
 #define INIT_LIST_HEAD(h) ((h)->next = (h)->prev = (h))
 #define LIST_HEAD(name) struct list_head name = { &(name), &(name) }
@@ -175,7 +175,7 @@ struct amdgpu_vm {
     struct { struct amdgpu_bo *bo; } root;
     struct dma_fence *last_unlocked, *last_seq_flush, *last_tlb_inv, *last_update;
     const struct amdgpu_vm_update_funcs *update_funcs;
-    struct list_head freed;
+    struct list_head freed, freed_explicit;
 };
 struct amdgpu_vm_update_params {
     struct amdgpu_device *adev;
@@ -196,6 +196,7 @@ static unsigned pte_writes, pte_calls, freed_mappings, tlb_flushes, resv_adds, p
 static bool device_present, reset_running, eviction_locked, sync_done, barrier_done, hdp_done, fail_alloc;
 static int sync_error, resv_error, commit_error, resv_collect_error, kmap_error;
 static unsigned fail_pte_call, kfd_waits, resv_collects;
+static enum amdgpu_sync_mode collected_modes[32];
 static struct dma_fence stub, old_fence, tlb_fence;
 static struct dma_resv reservation;
 static struct reset_domain reset_domain;
@@ -245,7 +246,7 @@ static void amdgpu_sync_create(struct amdgpu_sync *sync) { sync->initialized = t
 static void amdgpu_sync_free(struct amdgpu_sync *sync) { assert(sync->initialized); sync->initialized = false; }
 static int amdgpu_sync_resv(struct amdgpu_device *adev, struct amdgpu_sync *sync,
                             struct dma_resv *resv, enum amdgpu_sync_mode mode, struct amdgpu_vm *v)
-{ assert(sync->initialized && resv == &reservation); ++resv_collects; return resv_collect_error; }
+{ assert(sync->initialized && resv == &reservation && resv_collects < ARRAY_SIZE(collected_modes)); collected_modes[resv_collects++] = mode; return resv_collect_error; }
 static int amdgpu_sync_kfd(struct amdgpu_sync *sync, struct dma_resv *resv)
 { assert(sync->initialized && resv == &reservation); ++kfd_waits; return 0; }
 static int amdgpu_sync_wait(struct amdgpu_sync *sync, bool interruptible)
@@ -332,6 +333,7 @@ static void init(void)
                            .last_unlocked = dma_fence_get_stub(), .last_seq_flush = dma_fence_get_stub(),
                            .last_tlb_inv = dma_fence_get_stub(), .last_update = dma_fence_get(&old_fence), .update_funcs = &funcs};
     INIT_LIST_HEAD(&vm.freed);
+    INIT_LIST_HEAD(&vm.freed_explicit);
     for (unsigned i = 0; i < ARRAY_SIZE(entries); ++i) entries[i] = 0xdead;
     for (unsigned i = 0; i < ARRAY_SIZE(retired); ++i) {
         retired[i] = (struct amdgpu_bo_va_mapping){.start = i * 4, .last = i * 4 + 1};
@@ -548,6 +550,78 @@ static void per_bo_mapping_batches(void)
     assert(!prepares && !commits && !pte_writes && va.done == 1);
     finish();
 }
+
+static void mixed_retirement_batches(void)
+{
+    for (unsigned tlb = 0; tlb < 2; ++tlb) {
+        for (unsigned failure = 0; failure < 7; ++failure) {
+            init();
+            vm.need_tlb_fence = tlb;
+            list_add_tail(&retired[0].list, &vm.freed);
+            list_add_tail(&retired[1].list, &vm.freed_explicit);
+            switch (failure) {
+            case 1: fail_pte_call = 1; break;
+            case 2: fail_pte_call = 2; break;
+            case 3: commit_error = -EIO; break;
+            case 4: sync_error = -EINTR; break;
+            case 5: vm.evicting = true; break;
+            case 6: resv_collect_error = -ENOMEM; break;
+            }
+            int r = amdgpu_vm_clear_freed(&device, &vm, &vm.last_update);
+            assert(!!r == !!failure);
+            assert(collected_modes[0] == AMDGPU_SYNC_EQ_OWNER);
+            if (!failure || failure == 2) {
+                assert(collected_modes[1] == AMDGPU_SYNC_EXPLICIT_UNMAP);
+                assert(list_empty(&vm.freed));
+                assert(list_count(&vm.freed_explicit) == !!failure);
+            } else {
+                assert(resv_collects == 1);
+                assert(list_count(&vm.freed) == 1 && list_count(&vm.freed_explicit) == 1);
+            }
+            if (failure) {
+                /* Retrying must neither lose retirements nor their sync mode. */
+                unsigned previous_collects = resv_collects;
+                fail_pte_call = commit_error = resv_collect_error = sync_error = 0;
+                reset_running = vm.evicting = false;
+                assert(!amdgpu_vm_clear_freed(&device, &vm, &vm.last_update));
+                assert(collected_modes[previous_collects] ==
+                       (failure == 2 ? AMDGPU_SYNC_EXPLICIT_UNMAP : AMDGPU_SYNC_EQ_OWNER));
+                assert(collected_modes[resv_collects - 1] == AMDGPU_SYNC_EXPLICIT_UNMAP);
+            }
+            assert(list_empty(&vm.freed) && list_empty(&vm.freed_explicit));
+            assert(freed_mappings == 2 && retired[0].freed && retired[1].freed);
+            assert(!entries[0] && !entries[4]);
+            assert(vm.last_update == &stub && tlb_flushes >= 2u * tlb);
+            finish();
+        }
+    }
+    for (unsigned failure = 0; failure < 2; ++failure) {
+        init();
+        /* A reused VA cannot be populated until both retirement lists clear. */
+        struct ttm_resource resource = {.mem_type = TTM_PL_VRAM};
+        struct amdgpu_bo bo = {.always_valid = true,
+                               .tbo.base.resv = &reservation, .tbo.resource = &resource};
+        struct amdgpu_bo_va va = {.base = {.bo = &bo, .vm = &vm}};
+        INIT_LIST_HEAD(&va.invalids); INIT_LIST_HEAD(&va.valids);
+        retired[1].start = retired[0].start;
+        retired[1].last = retired[0].last;
+        retired[1].flags = AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_WRITEABLE;
+        list_add_tail(&retired[0].list, &vm.freed_explicit);
+        list_add_tail(&retired[1].list, &va.invalids);
+        if (failure) {
+            commit_error = -EIO;
+            assert(amdgpu_vm_bo_update(&device, &va, false) == -EIO);
+            assert(!va.done && list_count(&va.invalids) == 1 && list_count(&vm.freed_explicit) == 1);
+            commit_error = 0;
+        }
+        assert(!amdgpu_vm_bo_update(&device, &va, false));
+        assert(list_empty(&vm.freed_explicit) && retired[0].freed && va.done == 1);
+        assert(collected_modes[0] == AMDGPU_SYNC_EXPLICIT_UNMAP);
+        assert(entries[0] == 0x2000d && entries[1] == 0x2100d);
+        finish();
+    }
+}
+
 int main(void)
 {
     range_mapping();
@@ -556,6 +630,7 @@ int main(void)
     shared_eligibility();
     shared_bo_updates();
     per_bo_mapping_batches();
+    mixed_retirement_batches();
     printf("CPU VM batching: %u scenarios passed\n", cases);
     return 0;
 }

@@ -21,6 +21,8 @@ static_assert(offsetof(struct drm_amdgpu_salkim_caps, relative_priority_ip_mask)
 static_assert(sizeof(struct drm_amdgpu_gem_va_batch) == 32);
 static_assert(offsetof(struct drm_amdgpu_gem_va_batch, reserved) == 16);
 static_assert(sizeof(struct drm_amdgpu_gem_va_batch_op) == 32);
+static_assert(sizeof(struct drm_amdgpu_gem_va) == 64);
+static_assert(offsetof(struct drm_amdgpu_gem_va, vm_timeline_point) == 40);
 static_assert(sizeof(union drm_amdgpu_userq) == 72);
 static_assert(sizeof(struct drm_amdgpu_salkim_userq_create) == 80);
 static_assert(offsetof(struct drm_amdgpu_salkim_userq_create, relative_priority) == 72);
@@ -40,6 +42,9 @@ static int amdgpu_salkim_validate_request(const struct drm_amdgpu_salkim_request
 		break;
 	case AMDGPU_SALKIM_OP_VA_BATCH:
 		minimum = sizeof(struct drm_amdgpu_gem_va_batch);
+		break;
+	case AMDGPU_SALKIM_OP_UNMAP:
+		minimum = sizeof(struct drm_amdgpu_gem_va);
 		break;
 	case AMDGPU_SALKIM_OP_USERQ_CREATE:
 		minimum = sizeof(struct drm_amdgpu_salkim_userq_create);
@@ -66,6 +71,7 @@ static void amdgpu_salkim_get_caps(struct drm_device *dev, struct drm_file *filp
 		.magic = AMDGPU_SALKIM_MAGIC,
 		.abi = AMDGPU_SALKIM_ABI,
 		.size = sizeof(*caps),
+		.features = AMDGPU_SALKIM_CAP_EXPLICIT_UNMAP,
 	};
 	if (amdgpu_gem_va_batch_supported(adev, &fpriv->vm, false))
 		caps->features |= AMDGPU_SALKIM_CAP_BATCH_LEGACY;
@@ -111,6 +117,14 @@ static int amdgpu_salkim_ioctl(struct drm_device *dev, void *data,
 		if (r)
 			return r;
 		return amdgpu_gem_va_batch_ioctl(dev, &args, filp);
+	}
+	case AMDGPU_SALKIM_OP_UNMAP: {
+		struct drm_amdgpu_gem_va args;
+
+		r = copy_struct_from_user(&args, sizeof(args), payload, request->payload_size);
+		if (r)
+			return r;
+		return amdgpu_gem_va_unmap_ioctl(dev, &args, filp);
 	}
 	case AMDGPU_SALKIM_OP_USERQ_CREATE: {
 		struct drm_amdgpu_salkim_userq_create args;

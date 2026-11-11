@@ -36,7 +36,9 @@ enum amdgpu_sync_mode {
 	AMDGPU_SYNC_ALWAYS,
 	AMDGPU_SYNC_NE_OWNER,
 	AMDGPU_SYNC_EQ_OWNER,
-	AMDGPU_SYNC_EXPLICIT
+	AMDGPU_SYNC_EXPLICIT,
+	/* Completed VA accesses also exclude same-device UserQ render fences. */
+	AMDGPU_SYNC_EXPLICIT_UNMAP
 };
 
 /*

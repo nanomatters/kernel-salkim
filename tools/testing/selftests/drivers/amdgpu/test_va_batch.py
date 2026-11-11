@@ -184,7 +184,7 @@ struct amdgpu_vm {
     struct { struct amdgpu_bo *bo; } root;
     struct dma_fence *last_update, *last_tlb_inv, *last_bind;
     unsigned va; struct { struct list_head needs_update; } kernel;
-    struct list_head freed;
+    struct list_head freed, freed_explicit;
     struct amdgpu_vm_batch_state *batch_state;
     u64 tlb_seq;
 };
@@ -1088,7 +1088,7 @@ static void query_tests(void)
         bool legacy = timeline && !userq && !mapped_userq;
         assert(caps.magic == AMDGPU_SALKIM_MAGIC && caps.abi == AMDGPU_SALKIM_ABI);
         assert(caps.size == sizeof(caps));
-        assert(caps.features == (0 |
+        assert(caps.features == (AMDGPU_SALKIM_CAP_EXPLICIT_UNMAP |
             (timeline ? AMDGPU_SALKIM_CAP_BATCH_TIMELINE : 0) |
             (legacy ? AMDGPU_SALKIM_CAP_BATCH_LEGACY : 0)));
         assert(caps.max_ops == (timeline ? AMDGPU_GEM_VA_BATCH_MAX_OPS : 0));

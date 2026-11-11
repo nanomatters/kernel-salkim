@@ -38,10 +38,12 @@ struct drm_amdgpu_salkim_request {
 
 #define AMDGPU_SALKIM_OP_CAPS 1
 #define AMDGPU_SALKIM_OP_VA_BATCH 2
+#define AMDGPU_SALKIM_OP_UNMAP 3
 #define AMDGPU_SALKIM_OP_USERQ_CREATE 4
 
 #define AMDGPU_SALKIM_CAP_BATCH_LEGACY (1ULL << 0)
 #define AMDGPU_SALKIM_CAP_BATCH_TIMELINE (1ULL << 1)
+#define AMDGPU_SALKIM_CAP_EXPLICIT_UNMAP (1ULL << 2)
 
 /* Snapshot for this DRM file. Operations revalidate mutable VM eligibility. */
 struct drm_amdgpu_salkim_caps {
@@ -57,6 +59,12 @@ struct drm_amdgpu_salkim_caps {
 };
 
 /*
+ * UNMAP takes struct drm_amdgpu_gem_va with operation AMDGPU_VA_OP_UNMAP.
+ * _pad must be zero. Only AMDGPU_VM_DELAY_UPDATE is accepted in flags.
+ * The caller has completed
+ * every GPU access through the mapping. Movement, page-table update and TLB
+ * dependencies are retained. Completion is asynchronous, as for GEM_VA.
+ *
  * USERQ_CREATE takes this payload. args.in.op must be AMDGPU_USERQ_OP_CREATE,
  * and args.in.flags uses only standard AMDGPU global priority/security flags.
  * relative_priority is independently signed from -7 to 7. Creation failure

@@ -1554,7 +1554,8 @@ int amdgpu_vm_bo_update(struct amdgpu_device *adev, struct amdgpu_bo_va *bo_va,
 	int r;
 
 	/* A retried clear must not erase a replacement mapping. */
-	if (!clear && !list_empty(&vm->freed)) {
+	if (!clear && (!list_empty(&vm->freed) ||
+		       !list_empty(&vm->freed_explicit))) {
 		r = amdgpu_vm_clear_freed(adev, vm, &vm->last_update);
 		if (r)
 			return r;
@@ -1904,8 +1905,15 @@ error_free:
 int amdgpu_vm_clear_freed(struct amdgpu_device *adev, struct amdgpu_vm *vm,
 			  struct dma_fence **fence)
 {
-	return amdgpu_vm_clear_freed_list(adev, vm, &vm->freed,
-					AMDGPU_SYNC_EQ_OWNER, fence);
+	int r;
+
+	r = amdgpu_vm_clear_freed_list(adev, vm, &vm->freed,
+				       AMDGPU_SYNC_EQ_OWNER, fence);
+	if (r)
+		return r;
+
+	return amdgpu_vm_clear_freed_list(adev, vm, &vm->freed_explicit,
+					AMDGPU_SYNC_EXPLICIT_UNMAP, fence);
 }
 
 /**
@@ -2281,6 +2289,7 @@ int amdgpu_vm_bo_replace_map(struct amdgpu_device *adev,
  * @adev: amdgpu_device pointer
  * @bo_va: bo_va to remove the address from
  * @saddr: where to the BO is mapped
+ * @explicit_sync: userspace has completed all accesses through this mapping
  *
  * Remove a mapping of the BO at the specefied addr from the VM.
  *
@@ -2291,7 +2300,7 @@ int amdgpu_vm_bo_replace_map(struct amdgpu_device *adev,
  */
 int amdgpu_vm_bo_unmap(struct amdgpu_device *adev,
 		       struct amdgpu_bo_va *bo_va,
-		       uint64_t saddr)
+		       u64 saddr, bool explicit_sync)
 {
 	struct amdgpu_bo_va_mapping *mapping;
 	struct amdgpu_vm *vm = bo_va->base.vm;
@@ -2329,7 +2338,8 @@ int amdgpu_vm_bo_unmap(struct amdgpu_device *adev,
 	trace_amdgpu_vm_bo_unmap(bo_va, mapping);
 
 	if (valid)
-		list_add(&mapping->list, &vm->freed);
+		list_add(&mapping->list, explicit_sync ?
+			 &vm->freed_explicit : &vm->freed);
 	else
 		amdgpu_vm_free_mapping(adev, vm, mapping,
 				       bo_va->last_pt_update);
@@ -3061,6 +3071,7 @@ int amdgpu_vm_init(struct amdgpu_device *adev, struct amdgpu_vm *vm,
 	spin_lock_init(&vm->individual_lock);
 	amdgpu_vm_bo_status_init(&vm->individual);
 	INIT_LIST_HEAD(&vm->freed);
+	INIT_LIST_HEAD(&vm->freed_explicit);
 	INIT_KFIFO(vm->faults);
 	spin_lock_init(&vm->stats_lock);
 
@@ -3305,6 +3316,8 @@ void amdgpu_vm_fini(struct amdgpu_device *adev, struct amdgpu_vm *vm)
 	dma_fence_unlock_irqrestore(vm->last_seq_flush, flags);
 	dma_fence_put(vm->last_seq_flush);
 
+	/* Teardown no longer submits clears, but must release both sets. */
+	list_splice_init(&vm->freed_explicit, &vm->freed);
 	list_for_each_entry_safe(mapping, tmp, &vm->freed, list) {
 		if (mapping->flags & AMDGPU_VM_PAGE_PRT && prt_fini_needed) {
 			amdgpu_vm_prt_fini(adev, vm);
