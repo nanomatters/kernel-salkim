@@ -1264,7 +1264,7 @@ int amdgpu_vm_update_range(struct amdgpu_device *adev, struct amdgpu_vm *vm,
 		goto error_free;
 
 	if (params.needs_flush) {
-		amdgpu_vm_tlb_flush(&params, *fence, tlb_cb);
+		amdgpu_vm_tlb_flush(&params, fence ? *fence : NULL, tlb_cb);
 		tlb_cb = NULL;
 	}
 
