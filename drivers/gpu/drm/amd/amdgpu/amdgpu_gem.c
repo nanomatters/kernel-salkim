@@ -770,6 +770,31 @@ out:
 	return r;
 }
 
+static struct dma_fence *
+amdgpu_gem_va_update_fence(struct amdgpu_vm *vm,
+			   struct amdgpu_bo_va *bo_va, uint32_t operation)
+{
+	struct dma_fence *bo_fence = NULL, *fence;
+
+	if ((operation == AMDGPU_VA_OP_MAP ||
+	     operation == AMDGPU_VA_OP_REPLACE) &&
+	    !amdgpu_vm_is_bo_always_valid(vm, bo_va->base.bo))
+		bo_fence = bo_va->last_pt_update;
+
+	/* Do not carry completed failures into subsequent updates. */
+	fence = dma_fence_unwrap_merge(vm->last_update, vm->last_tlb_inv,
+				      bo_fence);
+	if (!fence) {
+		/* Allocation failure must not drop any pending dependency. */
+		dma_fence_wait(vm->last_update, false);
+		dma_fence_wait(vm->last_tlb_inv, false);
+		if (bo_fence)
+			dma_fence_wait(bo_fence, false);
+		fence = dma_fence_get_stub();
+	}
+	return fence;
+}
+
 /**
  * amdgpu_gem_va_update_vm -update the bo_va in its VM
  *
@@ -781,8 +806,8 @@ out:
  * Update the bo_va directly after setting its address. Errors are not
  * vital here, so they are not reported back to userspace.
  *
- * Returns resulting fence if freed BO(s) got cleared from the PT.
- * otherwise stub fence in case of error.
+ * Returns completion of pending published page-table updates and
+ * invalidation. Returns a stub if the VM is not ready.
  */
 static struct dma_fence *
 amdgpu_gem_va_update_vm(struct amdgpu_device *adev,
@@ -790,68 +815,33 @@ amdgpu_gem_va_update_vm(struct amdgpu_device *adev,
 			struct amdgpu_bo_va *bo_va,
 			uint32_t operation)
 {
-	struct dma_fence *fence;
 	int r = 0;
 
 	/* If the VM is not ready return only a stub. */
 	if (!amdgpu_vm_ready(vm))
 		return dma_fence_get_stub();
 
-
-	/*
-	 * First clean up any freed mappings in the VM.
-	 *
-	 * amdgpu_vm_clear_freed() may replace @fence with a new fence if it
-	 * schedules GPU work. If nothing needs clearing, @fence can remain as
-	 * the original vm->last_update.
-	 */
+	/* First clean up any freed mappings in the VM. */
 	r = amdgpu_vm_clear_freed(adev, vm, &vm->last_update);
 	if (r)
-		goto error;
+		goto out;
 
 	/* For MAP/REPLACE we also need to update the BO mappings. */
 	if (operation == AMDGPU_VA_OP_MAP ||
 	    operation == AMDGPU_VA_OP_REPLACE) {
 		r = amdgpu_vm_bo_update(adev, bo_va, false);
 		if (r)
-			goto error;
+			goto out;
 	}
 
 	/* Always update PDEs after we touched the mappings. */
 	r = amdgpu_vm_update_pdes(adev, vm, false);
 
-error:
+out:
 	if (r && r != -ERESTARTSYS)
 		DRM_ERROR("Couldn't update BO_VA (%d)\n", r);
 
-	if ((operation == AMDGPU_VA_OP_MAP ||
-	     operation == AMDGPU_VA_OP_REPLACE) &&
-	    !amdgpu_vm_is_bo_always_valid(vm, bo_va->base.bo)) {
-
-		/*
-		 * For MAP/REPLACE of non per-VM BOs we need to sync to both the
-		 * bo_va->last_pt_update and vm->last_update or otherwise we
-		 * potentially miss the PDE updates or TLB invalidation.
-		 */
-		fence = dma_fence_unwrap_merge(vm->last_update,
-					       vm->last_tlb_inv,
-					       bo_va->last_pt_update);
-		if (!fence)
-			dma_fence_wait(bo_va->last_pt_update, false);
-
-	} else {
-		fence = dma_fence_unwrap_merge(vm->last_update,
-					       vm->last_tlb_inv);
-	}
-
-	if (!fence) {
-		/* As fallback in OOM situations */
-		dma_fence_wait(vm->last_update, false);
-		dma_fence_wait(vm->last_tlb_inv, false);
-		fence = dma_fence_get_stub();
-	}
-
-	return fence;
+	return amdgpu_gem_va_update_fence(vm, bo_va, operation);
 }
 
 int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
