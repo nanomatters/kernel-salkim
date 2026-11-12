@@ -50,6 +50,7 @@
 #include "amdgpu_ras.h"
 #include "amdgpu_reset.h"
 #include "amdgpu_sched.h"
+#include "amdgpu_salkim.h"
 #include "amdgpu_xgmi.h"
 #include "amdgpu_userq.h"
 #include "amdgpu_userq_fence.h"
@@ -3012,7 +3013,10 @@ long amdgpu_drm_ioctl(struct file *filp,
 	if (ret < 0)
 		goto out;
 
-	ret = drm_ioctl(filp, cmd, arg);
+	if (cmd == AMDGPU_SALKIM_IOCTL)
+		ret = amdgpu_salkim_dispatch(filp, arg);
+	else
+		ret = drm_ioctl(filp, cmd, arg);
 
 out:
 	pm_runtime_put_autosuspend(dev->dev);
