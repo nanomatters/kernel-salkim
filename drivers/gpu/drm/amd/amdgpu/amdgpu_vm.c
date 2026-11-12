@@ -469,48 +469,70 @@ int amdgpu_vm_lock_pd(struct amdgpu_vm *vm, struct drm_exec *exec,
 }
 
 /**
- * amdgpu_vm_lock_individual - lock all BOs on the individual idle list
- * @vm: vm providing the BOs
+ * amdgpu_vm_lock_individual - snapshot and lock all individually reserved BOs
+ * @vm: vm providing the BOs, with its root PD reserved
  * @exec: drm execution context
  * @num_fences: number of extra fences to reserve
+ * @bos: returned snapshot, with a reference to each BO
+ * @num_bos: number of BOs in the returned snapshot
  *
- * Lock the BOs on the individual idle list in the DRM execution context.
+ * MMU notifiers can move userptr BOs between state lists without reserving
+ * them. Snapshot all three lists under individual_lock, then reserve the BOs
+ * without retaining a cursor into those lists. The root PD reservation keeps
+ * the set of BOs unchanged while the snapshot storage is allocated.
+ *
+ * On success the caller must drop the BO references and kvfree() the snapshot.
+ * On failure the output arguments are unchanged.
  */
 int amdgpu_vm_lock_individual(struct amdgpu_vm *vm, struct drm_exec *exec,
-			      unsigned int num_fences)
+			      unsigned int num_fences,
+			      struct amdgpu_bo ***bos, unsigned long *num_bos)
 {
-	struct list_head *prev = &vm->individual.idle;
-	struct amdgpu_bo_va *bo_va;
-	struct amdgpu_bo *bo;
+	struct list_head *lists[] = {
+		&vm->individual.idle,
+		&vm->individual.needs_update,
+		&vm->individual.evicted,
+	};
+	struct amdgpu_vm_bo_base *base;
+	struct amdgpu_bo **snapshot;
+	unsigned long count = 0, i;
+	unsigned int list;
 	int ret;
 
-	/* We can only trust prev->next while holding the lock */
+	amdgpu_vm_assert_locked(vm);
 	spin_lock(&vm->individual_lock);
-	while (!list_is_head(prev->next, &vm->individual.idle)) {
-		bo_va = list_entry(prev->next, typeof(*bo_va), base.vm_status);
-
-		bo = bo_va->base.bo;
-		if (bo) {
-			amdgpu_bo_ref(bo);
-			spin_unlock(&vm->individual_lock);
-
-			ret = drm_exec_prepare_obj(exec, &bo->tbo.base, num_fences);
-			amdgpu_bo_unref(&bo);
-			if (unlikely(ret))
-				return ret;
-
-			spin_lock(&vm->individual_lock);
-			/* The selected BO may have left idle while we waited.
-			 * Keep the cursor so the following BO is not skipped.
-			 */
-			if (prev->next != &bo_va->base.vm_status)
-				continue;
-		}
-		prev = prev->next;
-	}
+	for (list = 0; list < ARRAY_SIZE(lists); list++)
+		list_for_each_entry(base, lists[list], vm_status)
+			count++;
 	spin_unlock(&vm->individual_lock);
 
+	snapshot = kvmalloc_array(count, sizeof(*snapshot), GFP_KERNEL);
+	if (!snapshot && count)
+		return -ENOMEM;
+
+	i = 0;
+	spin_lock(&vm->individual_lock);
+	for (list = 0; list < ARRAY_SIZE(lists); list++)
+		list_for_each_entry(base, lists[list], vm_status)
+			snapshot[i++] = amdgpu_bo_ref(base->bo);
+	spin_unlock(&vm->individual_lock);
+
+	for (i = 0; i < count; i++) {
+		ret = drm_exec_prepare_obj(exec, &snapshot[i]->tbo.base,
+					   num_fences);
+		if (ret)
+			goto error;
+	}
+
+	*bos = snapshot;
+	*num_bos = count;
 	return 0;
+
+error:
+	for (i = 0; i < count; i++)
+		amdgpu_bo_unref(&snapshot[i]);
+	kvfree(snapshot);
+	return ret;
 }
 
 /**

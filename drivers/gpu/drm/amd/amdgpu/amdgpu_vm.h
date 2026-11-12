@@ -453,7 +453,8 @@ void amdgpu_vm_fini(struct amdgpu_device *adev, struct amdgpu_vm *vm);
 int amdgpu_vm_lock_pd(struct amdgpu_vm *vm, struct drm_exec *exec,
 		      unsigned int num_fences);
 int amdgpu_vm_lock_individual(struct amdgpu_vm *vm, struct drm_exec *exec,
-			      unsigned int num_fences);
+			      unsigned int num_fences,
+			      struct amdgpu_bo ***bos, unsigned long *num_bos);
 bool amdgpu_vm_ready(struct amdgpu_vm *vm);
 int amdgpu_vm_batch_prepare(struct amdgpu_vm *vm);
 int amdgpu_vm_batch_status(struct amdgpu_vm *vm);
