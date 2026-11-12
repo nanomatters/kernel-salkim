@@ -126,7 +126,7 @@ enum failure {
     NONE, DISABLED, READ_LOOKUP, WRITE_LOOKUP, QUEUE_LOOKUP,
     WPTR_READ, FENCE_ALLOC, READ_PREPARE, WRITE_PREPARE,
     QUEUE_HUNG, QUEUE_CANCELED, QUEUE_INVALID_VA, QUEUE_STOPPED,
-    LAST_PENDING, LAST_SUCCESS, LAST_CANCELED, LAST_ERROR,
+    RESTORE_INTERRUPTED, LAST_PENDING, LAST_SUCCESS, LAST_CANCELED, LAST_ERROR,
 };
 static enum failure failure;
 static unsigned alloc_count, fail_alloc, live_allocs, published, chains_owned;
@@ -273,8 +273,15 @@ static int amdgpu_userq_fence_alloc(struct amdgpu_usermode_queue *q,
     *out = &fence;
     return 0;
 }
-static void amdgpu_userq_ensure_ev_fence(struct amdgpu_userq_mgr *mgr, int *ev)
-{ assert(!mgr->userq_mutex); mgr->userq_mutex = 1; }
+#define ERESTARTSYS 512
+static int amdgpu_userq_ensure_ev_fence(struct amdgpu_userq_mgr *mgr, int *ev)
+{
+    assert(!mgr->userq_mutex);
+    if (failure == RESTORE_INTERRUPTED)
+        return -ERESTARTSYS;
+    mgr->userq_mutex = 1;
+    return 0;
+}
 static void amdgpu_userq_fence_init(struct amdgpu_usermode_queue *q,
                                     struct amdgpu_userq_fence *f, u64 wptr)
 {
@@ -415,6 +422,7 @@ int main(void)
     const int errors[] = {0, 0, -EFAULT, -EFAULT, -ENOENT, -EIO, -ENOMEM, -EINTR, -EINTR};
     for (enum failure fail = READ_LOOKUP; fail <= WRITE_PREPARE; ++fail)
         run_case(3, 7, true, false, fail, 0, 0, 0, false, errors[fail]);
+    run_case(3, 7, true, false, RESTORE_INTERRUPTED, 0, 0, 0, false, -ERESTARTSYS);
     run_case(3, 7, true, false, QUEUE_HUNG, 0, 0, 0, false, -ECANCELED);
     run_case(3, 7, true, false, QUEUE_CANCELED, 0, 0, 0, false, -ECANCELED);
     run_case(3, 7, true, false, QUEUE_INVALID_VA, 0, 0, 0, false, -ECANCELED);

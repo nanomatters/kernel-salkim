@@ -25,6 +25,8 @@
 #include <drm/drm_auth.h>
 #include <drm/drm_exec.h>
 #include <linux/pm_runtime.h>
+#include <linux/ratelimit.h>
+#include <linux/sched/signal.h>
 #include <linux/overflow.h>
 #include <drm/drm_drv.h>
 
@@ -568,18 +570,26 @@ static void amdgpu_userq_detach_doorbell(struct amdgpu_usermode_queue *queue)
  * Ensures that a valid and not yet signaled eviction fence is attached to the
  * usermode queue before any queue operations proceed. If it is signalled, then
  * rearm a new eviction fence.
+ *
+ * Return: 0 with userq_mutex held, or -ERESTARTSYS without it on interruption.
  */
-void
+int
 amdgpu_userq_ensure_ev_fence(struct amdgpu_userq_mgr *uq_mgr,
 			     struct amdgpu_eviction_fence_mgr *evf_mgr)
 {
 	struct dma_fence *ev_fence;
 
 retry:
+	if (fatal_signal_pending(current))
+		return -ERESTARTSYS;
+
 	/* Flush any pending resume work to create ev_fence */
 	flush_delayed_work(&uq_mgr->resume_work);
 
-	mutex_lock(&uq_mgr->userq_mutex);
+	if (fatal_signal_pending(current) ||
+	    mutex_lock_killable(&uq_mgr->userq_mutex))
+		return -ERESTARTSYS;
+
 	ev_fence = amdgpu_evf_mgr_get_fence(evf_mgr);
 	if (dma_fence_is_signaled(ev_fence)) {
 		dma_fence_put(ev_fence);
@@ -592,6 +602,7 @@ retry:
 		goto retry;
 	}
 	dma_fence_put(ev_fence);
+	return 0;
 }
 
 
@@ -893,7 +904,9 @@ amdgpu_userq_create(struct drm_file *filp, union drm_amdgpu_userq *args,
 	if (r)
 		goto clean_mqd;
 
-	amdgpu_userq_ensure_ev_fence(&fpriv->userq_mgr, &fpriv->evf_mgr);
+	r = amdgpu_userq_ensure_ev_fence(&fpriv->userq_mgr, &fpriv->evf_mgr);
+	if (r)
+		goto erase_doorbell;
 
 	/* don't map the queue if scheduling is halted */
 	if (!adev->userq_halt_for_enforce_isolation ||
@@ -1393,6 +1406,8 @@ get_pages:
 
 static void amdgpu_userq_restore_worker(struct work_struct *work)
 {
+	static DEFINE_RATELIMIT_STATE(restore_errors, DEFAULT_RATELIMIT_INTERVAL,
+				      DEFAULT_RATELIMIT_BURST);
 	struct amdgpu_userq_mgr *uq_mgr = work_to_uq_mgr(work, resume_work.work);
 	struct amdgpu_fpriv *fpriv = uq_mgr_to_fpriv(uq_mgr);
 	struct dma_fence *ev_fence;
@@ -1408,7 +1423,9 @@ static void amdgpu_userq_restore_worker(struct work_struct *work)
 		if (!READ_ONCE(fpriv->evf_mgr.shutdown))
 			schedule_delayed_work(&uq_mgr->resume_work, msecs_to_jiffies(1));
 	} else if (ret) {
-		drm_file_err(uq_mgr->file, "Failed to validate BOs to restore ret=%d\n", ret);
+		if (__ratelimit(&restore_errors))
+			drm_file_err(uq_mgr->file,
+				     "Failed to validate BOs to restore ret=%d\n", ret);
 		goto put_fence;
 	}
 
