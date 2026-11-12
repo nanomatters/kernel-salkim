@@ -241,7 +241,8 @@ static void spin_unlock(spinlock_t *lock)
 { assert(spin_depth); spin_depth--; assert(!pthread_mutex_unlock(&lock->mutex)); }
 #define spin_lock_irqsave(lock, flags) do { (flags) = 0; spin_lock(lock); } while (0)
 #define spin_unlock_irqrestore(lock, flags) do { (void)(flags); spin_unlock(lock); } while (0)
-#define lockdep_assert_held(lock) assert(spin_depth)
+#define lockdep_assert_held(lock) \
+    assert(_Generic((lock), struct mutex *: mutex_depth, default: spin_depth))
 
 struct mutex { pthread_mutex_t mutex; bool is_userq; };
 static void mutex_init(struct mutex *lock)
@@ -992,7 +993,9 @@ static void restore_invalid_mapping(void)
         fixture();
         queue.state = states[i];
         mappings_valid = false;
+        mutex_lock(&mgr.userq_mutex);
         assert(!amdgpu_userq_restore_all(&mgr));
+        mutex_unlock(&mgr.userq_mutex);
         if (states[i] == AMDGPU_USERQ_STATE_HUNG || states[i] == AMDGPU_USERQ_STATE_CANCELED)
             assert(queue.state == states[i]);
         else
@@ -1004,7 +1007,9 @@ static void restore_invalid_mapping(void)
 static void *blocked_restore_all(void *data)
 {
     block_after_validation = true;
+    mutex_lock(&mgr.userq_mutex);
     assert(!amdgpu_userq_restore_all(&mgr));
+    mutex_unlock(&mgr.userq_mutex);
     assert(!spin_depth && !mutex_depth);
     return NULL;
 }
