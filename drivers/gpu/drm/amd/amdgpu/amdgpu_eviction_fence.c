@@ -119,16 +119,15 @@ int amdgpu_evf_mgr_attach_fence(struct amdgpu_eviction_fence_mgr *evf_mgr,
 	return ret;
 }
 
-int amdgpu_evf_mgr_rearm(struct amdgpu_eviction_fence_mgr *evf_mgr,
-			 struct drm_exec *exec)
+struct dma_fence *
+amdgpu_evf_mgr_prepare(struct amdgpu_eviction_fence_mgr *evf_mgr)
 {
 	struct amdgpu_eviction_fence *ev_fence;
-	struct drm_gem_object *obj;
 
 	/* Create and initialize a new eviction fence */
 	ev_fence = kzalloc_obj(*ev_fence);
 	if (!ev_fence)
-		return -ENOMEM;
+		return NULL;
 
 	ev_fence->evf_mgr = evf_mgr;
 	get_task_comm(ev_fence->timeline_name, current);
@@ -137,17 +136,25 @@ int amdgpu_evf_mgr_rearm(struct amdgpu_eviction_fence_mgr *evf_mgr,
 			 &ev_fence->lock, evf_mgr->ev_fence_ctx,
 			 atomic_inc_return(&evf_mgr->ev_fence_seq));
 
-	/* Remember it for newly added BOs */
-	dma_fence_put(evf_mgr->ev_fence);
-	evf_mgr->ev_fence = &ev_fence->base;
+	return &ev_fence->base;
+}
 
-	/* And add it to all existing BOs */
-	drm_exec_for_each_locked_object(exec, obj) {
-		struct amdgpu_bo *bo = gem_to_amdgpu_bo(obj);
+/*
+ * Publish a prepared fence after validating the BOs and reserving fence slots.
+ * This must not allocate or validate memory: the caller holds notifier_lock.
+ * The manager takes its own reference to the prepared fence.
+ */
+void amdgpu_evf_mgr_rearm(struct amdgpu_eviction_fence_mgr *evf_mgr,
+			  struct drm_exec *exec, struct dma_fence *fence)
+{
+	struct drm_gem_object *obj;
+	struct dma_fence *old;
 
-		amdgpu_evf_mgr_attach_fence(evf_mgr, bo);
-	}
-	return 0;
+	old = rcu_replace_pointer(evf_mgr->ev_fence, dma_fence_get(fence), true);
+	dma_fence_put(old);
+
+	drm_exec_for_each_locked_object(exec, obj)
+		dma_resv_add_fence(obj->resv, fence, DMA_RESV_USAGE_BOOKKEEP);
 }
 
 void amdgpu_evf_mgr_detach_fence(struct amdgpu_eviction_fence_mgr *evf_mgr,
