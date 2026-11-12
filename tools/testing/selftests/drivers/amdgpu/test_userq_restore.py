@@ -993,9 +993,14 @@ struct amdgpu_fpriv { struct amdgpu_userq_mgr userq_mgr; struct eviction_mgr evf
 #define work_to_uq_mgr(work, member) container_of(work, struct amdgpu_userq_mgr, member)
 #define uq_mgr_to_fpriv(mgr) container_of(mgr, struct amdgpu_fpriv, userq_mgr)
 #define READ_ONCE(value) (value)
+#define DEFAULT_RATELIMIT_INTERVAL 1
+#define DEFAULT_RATELIMIT_BURST 1
+#define DEFINE_RATELIMIT_STATE(name, interval, burst) int name
 #define drm_file_err(...) (++errors)
 static struct amdgpu_fpriv fpriv;
-static unsigned retries, validations, errors;
+static unsigned retries, validations, errors, rate_checks;
+static bool allow_log = true;
+static bool __ratelimit(int *state) { (void)state; rate_checks++; return allow_log; }
 static int restore_error;
 static struct dma_fence *amdgpu_evf_mgr_get_fence(struct eviction_mgr *mgr)
 { mgr->fence.refs++; return &mgr->fence; }
@@ -1010,22 +1015,27 @@ ACTUAL_WORKER
 int main(void)
 {
     const int results[] = {0, -EAGAIN, -EFAULT, -ENOMEM, -EBUSY};
-    for (unsigned active = 0; active < 2; active++) {
+    for (unsigned logging = 0; logging < 2; logging++) {
+      allow_log = logging;
+      for (unsigned active = 0; active < 2; active++) {
         for (unsigned shutdown = 0; shutdown < 2; shutdown++) {
             for (unsigned result = 0; result < sizeof(results) / sizeof(results[0]); result++) {
                 fpriv = (struct amdgpu_fpriv){.evf_mgr = {.shutdown = shutdown,
                     .fence = {.signaled = active, .refs = 1}}};
-                retries = validations = errors = 0;
+                retries = validations = errors = rate_checks = 0;
                 restore_error = results[result];
                 amdgpu_userq_restore_worker(&fpriv.userq_mgr.resume_work.work);
                 assert(validations == active);
                 assert(retries == (active && !shutdown && restore_error == -EAGAIN));
-                assert(errors == (active && restore_error && restore_error != -EAGAIN));
+                bool permanent_error = active && restore_error && restore_error != -EAGAIN;
+                assert(rate_checks == permanent_error);
+                assert(errors == (permanent_error && logging));
                 assert(fpriv.evf_mgr.fence.refs == 1);
             }
         }
     }
-    puts("UserQ worker: 20 success/error/shutdown/fence-state cases passed");
+    }
+    puts("UserQ worker: 40 success/error/shutdown/fence-state and rate-limit cases passed");
     return 0;
 }
 '''
