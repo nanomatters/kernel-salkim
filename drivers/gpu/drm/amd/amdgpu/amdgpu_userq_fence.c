@@ -579,7 +579,9 @@ int amdgpu_userq_signal_ioctl(struct drm_device *dev, void *data,
 		goto put_queue;
 
 	/* Keep queue cancellation and fence creation serialized. */
-	amdgpu_userq_ensure_ev_fence(&fpriv->userq_mgr, &fpriv->evf_mgr);
+	r = amdgpu_userq_ensure_ev_fence(&fpriv->userq_mgr, &fpriv->evf_mgr);
+	if (r)
+		goto put_queue;
 	mutex_lock(&queue->state_mutex);
 	if (READ_ONCE(queue->hang_detect_stopped) ||
 	    queue->state == AMDGPU_USERQ_STATE_HUNG ||
