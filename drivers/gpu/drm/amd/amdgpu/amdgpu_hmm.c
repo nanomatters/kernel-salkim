@@ -187,6 +187,7 @@ int amdgpu_hmm_range_get_pages(struct mmu_interval_notifier *notifier,
 	hmm_range->default_flags = HMM_PFN_REQ_FAULT;
 	if (!readonly)
 		hmm_range->default_flags |= HMM_PFN_REQ_WRITE;
+	kvfree(hmm_range->hmm_pfns);
 	hmm_range->hmm_pfns = pfns;
 	hmm_range->start = start;
 	end = start + npages * PAGE_SIZE;
@@ -238,7 +239,7 @@ out_free_range:
  */
 bool amdgpu_hmm_range_valid(struct amdgpu_hmm_range *range)
 {
-	if (!range)
+	if (!range || !range->hmm_range.hmm_pfns)
 		return false;
 
 	return !mmu_interval_read_retry(range->hmm_range.notifier,
