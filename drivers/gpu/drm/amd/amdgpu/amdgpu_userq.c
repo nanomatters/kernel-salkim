@@ -1131,7 +1131,7 @@ amdgpu_userq_restore_all(struct amdgpu_userq_mgr *uq_mgr)
 	unsigned long queue_id;
 	int ret = 0, r;
 
-	mutex_lock(&uq_mgr->userq_mutex);
+	lockdep_assert_held(&uq_mgr->userq_mutex);
 	/* Resume all the queues for this process */
 	xa_for_each(&uq_mgr->userq_xa, queue_id, queue) {
 
@@ -1154,7 +1154,6 @@ amdgpu_userq_restore_all(struct amdgpu_userq_mgr *uq_mgr)
 		if (r)
 			ret = r;
 	}
-	mutex_unlock(&uq_mgr->userq_mutex);
 
 	if (ret)
 		drm_file_err(uq_mgr->file,
@@ -1170,84 +1169,16 @@ static int amdgpu_userq_validate_vm(void *param, struct amdgpu_bo *bo)
 	return ttm_bo_validate(&bo->tbo, &bo->placement, &ctx);
 }
 
-/*
- * Handle all individual BOs which were moved, lock and validate them and
- * update the PTs. An evicted individual BO lands on the needs_update list,
- * the evicted one only holds imported DMA-bufs of compute VMs.
- */
-static int
-amdgpu_userq_bo_validate(struct amdgpu_device *adev, struct drm_exec *exec,
-			 struct amdgpu_vm *vm)
+static void amdgpu_userq_put_restore_bos(struct amdgpu_bo ***bos,
+					 unsigned long *num_bos)
 {
-	struct ttm_operation_ctx ctx = { false, false };
-	struct amdgpu_bo_va *bo_va;
-	struct amdgpu_bo *bo, *tmp;
-	int ret;
+	unsigned long i;
 
-retry:
-	spin_lock(&vm->individual_lock);
-	while (!list_empty(&vm->individual.evicted) ||
-	       !list_empty(&vm->individual.needs_update)) {
-		struct list_head *pending = !list_empty(&vm->individual.evicted) ?
-			&vm->individual.evicted : &vm->individual.needs_update;
-
-		bo_va = list_first_entry(pending,
-					 struct amdgpu_bo_va,
-					 base.vm_status);
-		bo = bo_va->base.bo;
-		tmp = amdgpu_bo_ref(bo);
-		spin_unlock(&vm->individual_lock);
-
-		ret = drm_exec_prepare_obj(exec, &bo->tbo.base,
-					   TTM_NUM_MOVE_FENCES + 1);
-		amdgpu_bo_unref(&tmp);
-		if (unlikely(ret))
-			return ret;
-
-		amdgpu_bo_placement_from_domain(bo, bo->allowed_domains);
-		ret = ttm_bo_validate(&bo->tbo, &bo->placement, &ctx);
-		if (ret)
-			return ret;
-
-		/* This moves the bo_va to the idle list */
-		ret = amdgpu_vm_bo_update(adev, bo_va, false);
-		if (ret)
-			return ret;
-
-		spin_lock(&vm->individual_lock);
-	}
-
-	/*
-	 * A GEM_VA operation or a kernel CS can update the PTEs of an evicted
-	 * BO without validating it, which moves it to the idle list with PTEs
-	 * pointing nowhere. Validate those as well, that moves them back to the
-	 * needs_update list.
-	 */
-	list_for_each_entry(bo_va, &vm->individual.idle, base.vm_status) {
-		bo = bo_va->base.bo;
-		if (!bo || amdgpu_ttm_tt_is_userptr(bo->tbo.ttm) ||
-		    (bo->allowed_domains & AMDGPU_GEM_DOMAIN_CPU) ||
-		    (bo->tbo.resource &&
-		     bo->tbo.resource->mem_type != TTM_PL_SYSTEM))
-			continue;
-
-		tmp = amdgpu_bo_ref(bo);
-		spin_unlock(&vm->individual_lock);
-
-		ret = drm_exec_prepare_obj(exec, &bo->tbo.base,
-					   TTM_NUM_MOVE_FENCES + 1);
-		if (likely(!ret)) {
-			amdgpu_bo_placement_from_domain(bo, bo->allowed_domains);
-			ret = ttm_bo_validate(&bo->tbo, &bo->placement, &ctx);
-		}
-		amdgpu_bo_unref(&tmp);
-		if (ret)
-			return ret;
-		goto retry;
-	}
-	spin_unlock(&vm->individual_lock);
-
-	return 0;
+	for (i = 0; i < *num_bos; i++)
+		amdgpu_bo_unref(&(*bos)[i]);
+	kvfree(*bos);
+	*bos = NULL;
+	*num_bos = 0;
 }
 
 /* Make sure the whole VM is ready to be used */
@@ -1255,17 +1186,19 @@ static int
 amdgpu_userq_vm_validate_and_restore_queue(struct amdgpu_userq_mgr *uq_mgr)
 {
 	struct amdgpu_fpriv *fpriv = uq_mgr_to_fpriv(uq_mgr);
-	bool invalidated = false, new_addition = false;
 	struct ttm_operation_ctx ctx = { true, false };
 	struct amdgpu_device *adev = uq_mgr->adev;
-	struct amdgpu_hmm_range *range;
 	struct amdgpu_vm *vm = &fpriv->vm;
-	unsigned long key, tmp_key;
-	struct amdgpu_bo_va *bo_va;
 	struct amdgpu_usermode_queue *queue;
+	struct dma_fence *ev_fence = NULL;
+	struct amdgpu_hmm_range *range;
+	struct amdgpu_bo **bos = NULL;
+	unsigned long num_bos = 0, i, key;
+	struct amdgpu_bo_va *bo_va;
 	struct amdgpu_bo *bo;
 	struct drm_exec exec;
 	struct xarray xa;
+	bool new_addition;
 	int ret;
 
 	trace_amdgpu_userq_restore(vm, true, 0);
@@ -1274,74 +1207,110 @@ amdgpu_userq_vm_validate_and_restore_queue(struct amdgpu_userq_mgr *uq_mgr)
 retry_lock:
 	drm_exec_init(&exec, DRM_EXEC_IGNORE_DUPLICATES, 0);
 	drm_exec_until_all_locked(&exec) {
-		/*
-		 * Rearm adds one BOOKKEEP fence and validation may queue move fences
-		 * on the root PD BO, so reserve caller-side slots accordingly.
-		 */
+		amdgpu_userq_put_restore_bos(&bos, &num_bos);
+		/* Reserve slots for the replacement fence and validation moves. */
 		ret = amdgpu_vm_lock_pd(vm, &exec, TTM_NUM_MOVE_FENCES + 1);
 		drm_exec_retry_on_contention(&exec);
-		if (unlikely(ret))
+		if (ret)
 			goto unlock_all;
 
-		ret = amdgpu_vm_lock_individual(vm, &exec, TTM_NUM_MOVE_FENCES + 1);
+		ret = amdgpu_vm_lock_individual(vm, &exec, TTM_NUM_MOVE_FENCES + 1,
+						&bos, &num_bos);
 		drm_exec_retry_on_contention(&exec);
-		if (unlikely(ret))
+		if (ret)
 			goto unlock_all;
 
-		/* This validates PDs, PTs and per VM BOs */
-		ret = amdgpu_vm_validate(adev, vm, NULL,
-					 amdgpu_userq_validate_vm,
-					 NULL);
-		if (unlikely(ret))
-			goto unlock_all;
+		/* A BO can be unmapped while the HMM fault drops our locks. */
+		xa_for_each(&xa, key, range) {
+			ret = drm_exec_prepare_obj(&exec, &range->bo->tbo.base,
+						   TTM_NUM_MOVE_FENCES + 1);
+			drm_exec_retry_on_contention(&exec);
+			if (ret)
+				goto unlock_all;
+		}
 
-		/* This locks and validates the remaining evicted BOs */
-		ret = amdgpu_userq_bo_validate(adev, &exec, vm);
-		drm_exec_retry_on_contention(&exec);
-		if (unlikely(ret))
-			goto unlock_all;
-
-		/*
-		 * WPTR BOs are VM-mapped, but each BO has its own reservation
-		 * object. Lock them into this drm_exec ww context so the later
-		 * amdgpu_bo_gpu_offset() reads are done with the BO resv locked.
-		 */
-		xa_for_each(&uq_mgr->userq_xa, tmp_key, queue) {
-			struct ttm_operation_ctx wptr_ctx = { false, false };
-
+		xa_for_each(&uq_mgr->userq_xa, key, queue) {
 			bo = queue->wptr_obj.obj;
-			if (!bo)
-				continue;
-
+			if (!bo) {
+				ret = -EINVAL;
+				goto unlock_all;
+			}
 			ret = drm_exec_prepare_obj(&exec, &bo->tbo.base,
 						   TTM_NUM_MOVE_FENCES + 1);
 			drm_exec_retry_on_contention(&exec);
-			if (unlikely(ret))
-				goto unlock_all;
-
-			amdgpu_bo_placement_from_domain(bo, bo->allowed_domains);
-			ret = ttm_bo_validate(&bo->tbo, &bo->placement, &wptr_ctx);
-			if (unlikely(ret))
+			if (ret)
 				goto unlock_all;
 		}
 	}
 
-	if (invalidated) {
-		xa_for_each(&xa, tmp_key, range) {
-			bo = range->bo;
-			amdgpu_bo_placement_from_domain(bo, AMDGPU_GEM_DOMAIN_CPU);
-			ret = ttm_bo_validate(&bo->tbo, &bo->placement, &ctx);
-			if (ret)
-				goto unlock_all;
+	/* Drop ranges whose BO was closed while the HMM fault dropped locks. */
+	xa_for_each(&xa, key, range) {
+		if (amdgpu_vm_bo_find(vm, range->bo))
+			continue;
+		xa_erase(&xa, key);
+		amdgpu_hmm_range_free(range);
+	}
 
-			amdgpu_ttm_tt_set_user_pages(bo->tbo.ttm, range);
+	/* Use the snapshot, not state lists which MMU notifiers can reorder. */
+	new_addition = false;
+	for (i = 0; i < num_bos; i++) {
+		bo = bos[i];
+		if (!amdgpu_ttm_tt_is_userptr(bo->tbo.ttm))
+			continue;
+		key = (unsigned long)bo;
+		if (xa_load(&xa, key))
+			continue;
 
-			amdgpu_bo_placement_from_domain(bo, AMDGPU_GEM_DOMAIN_GTT);
-			ret = ttm_bo_validate(&bo->tbo, &bo->placement, &ctx);
-			if (ret)
-				goto unlock_all;
+		range = amdgpu_hmm_range_alloc(bo);
+		if (!range) {
+			ret = -ENOMEM;
+			goto unlock_all;
 		}
-		invalidated = false;
+		ret = xa_err(xa_store(&xa, key, range, GFP_KERNEL));
+		if (ret) {
+			amdgpu_hmm_range_free(range);
+			goto unlock_all;
+		}
+		new_addition = true;
+	}
+	if (new_addition)
+		goto get_pages;
+
+	/* Install refreshed pages before validating any userptr BO into GTT. */
+	xa_for_each(&xa, key, range) {
+		bo = range->bo;
+		amdgpu_bo_placement_from_domain(bo, AMDGPU_GEM_DOMAIN_CPU);
+		ret = ttm_bo_validate(&bo->tbo, &bo->placement, &ctx);
+		if (ret)
+			goto unlock_all;
+		amdgpu_ttm_tt_set_user_pages(bo->tbo.ttm, range);
+		amdgpu_bo_placement_from_domain(bo, AMDGPU_GEM_DOMAIN_GTT);
+		ret = ttm_bo_validate(&bo->tbo, &bo->placement, &ctx);
+		if (ret)
+			goto unlock_all;
+	}
+
+	ret = amdgpu_vm_validate(adev, vm, drm_exec_ticket(&exec),
+				 amdgpu_userq_validate_vm, NULL);
+	if (ret)
+		goto unlock_all;
+
+	/* Every individual BO is reserved, including those sharing a resv. */
+	for (i = 0; i < num_bos; i++) {
+		ret = amdgpu_userq_validate_vm(NULL, bos[i]);
+		if (ret)
+			goto unlock_all;
+	}
+	xa_for_each(&uq_mgr->userq_xa, key, queue) {
+		bo = queue->wptr_obj.obj;
+		ret = amdgpu_userq_validate_vm(NULL, bo);
+		if (ret)
+			goto unlock_all;
+		ret = amdgpu_ttm_alloc_gart(&bo->tbo);
+		if (ret)
+			goto unlock_all;
+		queue->wptr_obj.gpu_addr = amdgpu_bo_gpu_offset(bo) +
+					    queue->wptr_bo_offset;
 	}
 
 	/* Preserve mappings of BOs already locked by this restore operation. */
@@ -1349,125 +1318,77 @@ retry_lock:
 	if (ret)
 		goto unlock_all;
 
-	/*
-	 * PRT/sparse mappings are kept off the vm_bo state lists, so
-	 * amdgpu_vm_handle_moved() does not touch them. Refresh their PTEs
-	 * explicitly here (as the CS path does) so sparse mappings survive a
-	 * VRAM-lost reset.
-	 */
+	/* PRT mappings are kept off the BO state lists. */
 	ret = amdgpu_vm_bo_update(adev, fpriv->prt_va, false);
 	if (ret)
 		goto unlock_all;
-
-	key = 0;
-	/* Validate User Ptr BOs */
-	list_for_each_entry(bo_va, &vm->always_valid.idle, base.vm_status) {
-		bo = bo_va->base.bo;
-		if (!bo)
-			continue;
-
-		if (!amdgpu_ttm_tt_is_userptr(bo->tbo.ttm))
-			continue;
-
-		range = xa_load(&xa, key);
-		if (range && range->bo != bo) {
-			xa_erase(&xa, key);
-			amdgpu_hmm_range_free(range);
-			range = NULL;
-		}
-
-		if (!range) {
-			range = amdgpu_hmm_range_alloc(bo);
-			if (!range) {
-				ret = -ENOMEM;
-				goto unlock_all;
-			}
-
-			ret = xa_err(xa_store(&xa, key, range, GFP_KERNEL));
-			if (ret) {
-				amdgpu_hmm_range_free(range);
-				goto unlock_all;
-			}
-			new_addition = true;
-		}
-		key++;
-	}
-
-	if (new_addition) {
-		drm_exec_fini(&exec);
-		xa_for_each(&xa, tmp_key, range) {
-			if (!range)
-				continue;
-			bo = range->bo;
-			ret = amdgpu_ttm_tt_get_user_pages(bo, range);
-			if (ret)
-				goto free_ranges;
-		}
-
-		invalidated = true;
-		new_addition = false;
-		goto retry_lock;
-	}
-
 	ret = amdgpu_vm_update_pdes(adev, vm, false);
 	if (ret)
 		goto unlock_all;
 
-	/*
-	 * We need to wait for all VM updates to finish before restarting the
-	 * queues. Using the idle list like that is now ok since everything is
-	 * locked in place.
-	 */
-	list_for_each_entry(bo_va, &vm->always_valid.idle, base.vm_status)
-		dma_fence_wait(bo_va->last_pt_update, false);
-	/*
-	 * The PRT bo_va is kept off the state lists, so its PTE update fence
-	 * lands in prt_va->last_pt_update rather than vm->last_update; wait on
-	 * it explicitly (as the CS path syncs it) before restarting queues.
-	 */
+	/* Wait for individual PTE updates without walking mutable state lists. */
+	for (i = 0; i < num_bos; i++) {
+		bo_va = amdgpu_vm_bo_find(vm, bos[i]);
+		if (bo_va)
+			dma_fence_wait(bo_va->last_pt_update, false);
+	}
 	dma_fence_wait(fpriv->prt_va->last_pt_update, false);
 	dma_fence_wait(vm->last_update, false);
 	dma_fence_wait(vm->last_tlb_inv, false);
 
-	xa_for_each(&uq_mgr->userq_xa, tmp_key, queue) {
-		bo = queue->wptr_obj.obj;
-		if (!bo) {
-			ret = -EINVAL;
+	if (!ev_fence) {
+		ev_fence = amdgpu_evf_mgr_prepare(&fpriv->evf_mgr);
+		if (!ev_fence) {
+			ret = -ENOMEM;
 			goto unlock_all;
 		}
-
-		ret = amdgpu_ttm_alloc_gart(&bo->tbo);
-		if (unlikely(ret)) {
-			drm_file_err(uq_mgr->file,
-				     "failed to bind wptr bo to gart on resume, qid=%lu ret=%d\n",
-				     tmp_key, ret);
-			goto unlock_all;
-		}
-
-		queue->wptr_obj.gpu_addr = amdgpu_bo_gpu_offset(bo) +
-					    queue->wptr_bo_offset;
 	}
 
-	ret = amdgpu_evf_mgr_rearm(&fpriv->evf_mgr, &exec);
-	if (ret) {
-		drm_file_err(uq_mgr->file, "Failed to replace eviction fence\n");
-		goto unlock_all;
+	/*
+	 * Do not allocate under notifier_lock. Recheck the page snapshots and
+	 * publish their protection atomically against MMU invalidation. Keep
+	 * userq_mutex until the queues are mapped so an invalidation cannot
+	 * signal the new eviction fence before we restart them.
+	 */
+	mutex_lock(&uq_mgr->userq_mutex);
+	mutex_lock(&adev->notifier_lock);
+	ret = -EAGAIN;
+	xa_for_each(&xa, key, range) {
+		if (!amdgpu_hmm_range_valid(range))
+			goto unlock_notifier;
 	}
+	if (!list_empty(&vm->individual.needs_update) ||
+	    !list_empty(&vm->individual.evicted))
+		goto unlock_notifier;
 
-	ret = amdgpu_userq_restore_all(uq_mgr);
+	amdgpu_evf_mgr_rearm(&fpriv->evf_mgr, &exec, ev_fence);
+	ret = 0;
+unlock_notifier:
+	mutex_unlock(&adev->notifier_lock);
+	if (!ret)
+		ret = amdgpu_userq_restore_all(uq_mgr);
+	mutex_unlock(&uq_mgr->userq_mutex);
 
 unlock_all:
 	drm_exec_fini(&exec);
+	amdgpu_userq_put_restore_bos(&bos, &num_bos);
 free_ranges:
-	xa_for_each(&xa, tmp_key, range) {
-		if (!range)
-			continue;
-		bo = range->bo;
+	xa_for_each(&xa, key, range)
 		amdgpu_hmm_range_free(range);
-	}
 	xa_destroy(&xa);
+	dma_fence_put(ev_fence);
 	trace_amdgpu_userq_restore(vm, false, ret);
 	return ret;
+
+get_pages:
+	drm_exec_fini(&exec);
+	amdgpu_userq_put_restore_bos(&bos, &num_bos);
+	xa_for_each(&xa, key, range) {
+		ret = amdgpu_ttm_tt_get_user_pages(range->bo, range);
+		if (ret)
+			goto free_ranges;
+	}
+	goto retry_lock;
 }
 
 static void amdgpu_userq_restore_worker(struct work_struct *work)
@@ -1482,7 +1403,11 @@ static void amdgpu_userq_restore_worker(struct work_struct *work)
 		goto put_fence;
 
 	ret = amdgpu_userq_vm_validate_and_restore_queue(uq_mgr);
-	if (ret) {
+	if (ret == -EAGAIN) {
+		/* HMM invalidation can race a page fault. Retry without a new ioctl. */
+		if (!READ_ONCE(fpriv->evf_mgr.shutdown))
+			schedule_delayed_work(&uq_mgr->resume_work, msecs_to_jiffies(1));
+	} else if (ret) {
 		drm_file_err(uq_mgr->file, "Failed to validate BOs to restore ret=%d\n", ret);
 		goto put_fence;
 	}
