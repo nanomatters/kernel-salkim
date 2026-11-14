@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
-"""Exercise explicit UNMAP flags, mapping retirement and fence selection."""
+"""Exercise standard VA flags, explicit mapping retirement and fence selection."""
 import os
 import pathlib
 import re
@@ -123,14 +123,9 @@ static void flags(void)
 {
     for (unsigned op = 0; op < 6; ++op) {
         for (unsigned f = 0; f < 4096; ++f) {
-            bool expected;
-            if (f & AMDGPU_VM_UNMAP_EXPLICIT_SYNC)
-                expected = op == AMDGPU_VA_OP_UNMAP && !(f & ~(AMDGPU_VM_UNMAP_EXPLICIT_SYNC | AMDGPU_VM_DELAY_UPDATE));
-            else {
-                unsigned ordinary = AMDGPU_VM_DELAY_UPDATE | AMDGPU_VM_PAGE_READABLE |
-                    AMDGPU_VM_PAGE_WRITEABLE | AMDGPU_VM_PAGE_EXECUTABLE | AMDGPU_VM_MTYPE_MASK | AMDGPU_VM_PAGE_NOALLOC;
-                expected = !(f & ~ordinary) || !(f & ~(AMDGPU_VM_DELAY_UPDATE | AMDGPU_VM_PAGE_PRT));
-            }
+            unsigned ordinary = AMDGPU_VM_DELAY_UPDATE | AMDGPU_VM_PAGE_READABLE |
+                AMDGPU_VM_PAGE_WRITEABLE | AMDGPU_VM_PAGE_EXECUTABLE | AMDGPU_VM_MTYPE_MASK | AMDGPU_VM_PAGE_NOALLOC;
+            bool expected = !(f & ~ordinary) || !(f & ~(AMDGPU_VM_DELAY_UPDATE | AMDGPU_VM_PAGE_PRT));
             assert(amdgpu_gem_va_flags_valid(op, f) == expected); ++cases;
         }
     }

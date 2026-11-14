@@ -57,7 +57,8 @@ class SalkimUapiTests(unittest.TestCase):
             subprocess.run([str(path / 'test')], check=True, timeout=30)
 
     def test_compat_command_routing(self):
-        actual = function((AMD / 'amdgpu_ioc32.c').read_text(), 'amdgpu_kms_compat_ioctl')
+        source = (AMD / 'amdgpu_drv.c').read_text()
+        actual = function(source, 'amdgpu_drm_ioctl') + '\n' + function(source, 'amdgpu_kms_compat_ioctl')
         with tempfile.TemporaryDirectory(prefix='salkim-compat-') as temporary:
             path = pathlib.Path(temporary)
             (path / 'test.c').write_text(COMPAT.replace('ACTUAL_SOURCE', actual))
@@ -69,13 +70,13 @@ class SalkimUapiTests(unittest.TestCase):
         source = (AMD / 'amdgpu_drv.c').read_text()
         actual = function(source, 'amdgpu_drm_ioctl')
         self.assertRegex(actual, r'if \(cmd == AMDGPU_SALKIM_IOCTL\)\s*'
-                         r'ret = amdgpu_salkim_dispatch\(filp, arg\);\s*else\s*'
-                         r'ret = drm_ioctl\(filp, cmd, arg\);')
-        self.assertLess(actual.index('pm_runtime_get_sync'), actual.index('amdgpu_salkim_dispatch'))
-        self.assertGreater(actual.index('pm_runtime_put_autosuspend'), actual.index('amdgpu_salkim_dispatch'))
-        compat = function((AMD / 'amdgpu_ioc32.c').read_text(), 'amdgpu_kms_compat_ioctl')
+                         r'return amdgpu_salkim_dispatch\(filp, arg\);\s*'
+                         r'return drm_ioctl\(filp, cmd, arg\);')
+        self.assertNotIn('pm_runtime_', actual)
+        self.assertNotIn('PM_RUNTIME_', actual)
+        compat = function(source, 'amdgpu_kms_compat_ioctl')
         self.assertRegex(compat, r'if \(cmd == AMDGPU_SALKIM_IOCTL\)\s*'
-                         r'return amdgpu_drm_ioctl\(filp, cmd, \(unsigned long\)compat_ptr\(arg\)\);')
+                         r'return amdgpu_salkim_dispatch\(filp, \(unsigned long\)compat_ptr\(arg\)\);')
         standard = (ROOT / 'include/uapi/drm/amdgpu_drm.h').read_text()
         for name in ('AMDGPU_INFO_GEM_VA_BATCH', 'DRM_AMDGPU_GEM_VA_BATCH',
                      'AMDGPU_IDS_FLAGS_VM_UNMAP_EXPLICIT_SYNC', 'AMDGPU_VM_UNMAP_EXPLICIT_SYNC',
@@ -112,26 +113,34 @@ COMPAT = r'''
 #define DRM_IOCTL_TYPE(cmd) _IOC_TYPE(cmd)
 #define compat_ptr(arg) ((void *)(uintptr_t)(uint32_t)(arg))
 struct file { int unused; };
-static unsigned native_calls, compat_calls;
-static unsigned long native_arg;
-static long amdgpu_drm_ioctl(struct file *filp, unsigned cmd, unsigned long arg)
-{ ++native_calls; native_arg = arg; return 101; }
+static unsigned private_calls, compat_calls, native_calls;
+static unsigned long private_arg;
+static long amdgpu_salkim_dispatch(struct file *filp, unsigned long arg)
+{ ++private_calls; private_arg = arg; return 101; }
 static long drm_compat_ioctl(struct file *filp, unsigned cmd, unsigned long arg)
-{ ++compat_calls; return 102; }
+{ ++compat_calls; return _IOC_TYPE(cmd) == DRM_IOCTL_BASE ? 102 : -ENOTTY; }
+static long drm_ioctl(struct file *filp, unsigned cmd, unsigned long arg)
+{ ++native_calls; return _IOC_TYPE(cmd) == DRM_IOCTL_BASE ? 103 : -ENOTTY; }
 ACTUAL_SOURCE
 int main(void)
 {
     struct file filp = {0};
     assert(amdgpu_kms_compat_ioctl(&filp, AMDGPU_SALKIM_IOCTL, 0xfeedface00001234UL) == 101);
-    assert(native_arg == 0x1234 && native_calls == 1 && !compat_calls);
+    assert(private_arg == 0x1234 && private_calls == 1 && !compat_calls && !native_calls);
+    assert(amdgpu_drm_ioctl(&filp, AMDGPU_SALKIM_IOCTL, 0x1234567800001234UL) == 101);
+    assert(private_arg == 0x1234567800001234UL && private_calls == 2);
     for (unsigned nr = 0; nr < 256; ++nr) {
         assert(amdgpu_kms_compat_ioctl(&filp, _IO('S', nr), 0) == -ENOTTY);
         assert(amdgpu_kms_compat_ioctl(&filp, _IOWR('S', nr, uint32_t), 0) == -ENOTTY);
+        assert(amdgpu_drm_ioctl(&filp, _IO('S', nr), 0) == -ENOTTY);
+        assert(amdgpu_drm_ioctl(&filp, _IOWR('S', nr, uint32_t), 0) == -ENOTTY);
     }
-    assert(native_calls == 1 && !compat_calls);
+    assert(private_calls == 2 && compat_calls == 512 && native_calls == 512);
     assert(amdgpu_kms_compat_ioctl(&filp, _IO('d', 0), 0) == 102);
-    assert(amdgpu_kms_compat_ioctl(&filp, _IO('d', DRM_COMMAND_BASE), 0) == 101);
-    assert(native_calls == 2 && compat_calls == 1);
+    assert(amdgpu_kms_compat_ioctl(&filp, _IO('d', DRM_COMMAND_BASE), 0) == 102);
+    assert(amdgpu_drm_ioctl(&filp, _IO('d', 0), 0) == 103);
+    assert(amdgpu_drm_ioctl(&filp, _IO('d', DRM_COMMAND_BASE), 0) == 103);
+    assert(private_calls == 2 && compat_calls == 514 && native_calls == 514);
     return 0;
 }
 '''
@@ -196,6 +205,12 @@ static int amdgpu_gem_va_batch_ioctl(struct drm_device *dev, void *data, struct 
     ++batch_calls;
     return backend_result;
 }
+static int amdgpu_gem_va_unmap_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
+{
+    ++unmap_calls;
+    assert(((struct drm_amdgpu_gem_va *)data)->operation == AMDGPU_VA_OP_UNMAP);
+    return backend_result;
+}
 
 struct amdgpu_usermode_queue { unsigned refs; };
 static struct amdgpu_usermode_queue created;
@@ -256,9 +271,11 @@ int main(void)
         unsigned char bytes[4096];
         struct drm_amdgpu_salkim_caps caps;
         struct drm_amdgpu_gem_va_batch batch;
+        struct drm_amdgpu_gem_va unmap;
         struct drm_amdgpu_salkim_userq_create create;
     } payload = {0};
-    const unsigned sizes[] = {0, sizeof(payload.caps), sizeof(payload.batch), 0, sizeof(payload.create)};
+    const unsigned sizes[] = {0, sizeof(payload.caps), sizeof(payload.batch),
+                             sizeof(payload.unmap), sizeof(payload.create)};
     struct drm_amdgpu_salkim_request req = {.magic = AMDGPU_SALKIM_MAGIC,
         .abi = AMDGPU_SALKIM_ABI, .op = AMDGPU_SALKIM_OP_CAPS,
         .payload = (uintptr_t)&payload, .payload_size = sizeof(payload.caps)};
@@ -276,11 +293,6 @@ int main(void)
     assert(amdgpu_salkim_ioctl(&dev, &req, &filp) == -EINVAL);
     no_backend(); assert(!copies_in && !copies_out);
     for (unsigned op = 1; op <= 4; ++op) {
-        if (!sizes[op]) {
-            req = good; req.op = op;
-            assert(amdgpu_salkim_ioctl(&dev, &req, &filp) == -ENOTTY);
-            continue;
-        }
         req = good; req.op = op;
         for (unsigned size = 0; size < sizes[op]; ++size) {
             req.payload_size = size;
@@ -314,9 +326,9 @@ int main(void)
     assert(!amdgpu_salkim_ioctl(&dev, &req, &filp));
     for (unsigned i = sizeof(payload.caps); i < sizeof(payload); ++i) assert(!payload.bytes[i]);
     for (unsigned op = 2; op <= 4; ++op) {
-        if (!sizes[op]) continue;
         reset_counters(); memset(&payload, 0, sizeof(payload));
         req = good; req.op = op; req.payload_size = sizes[op];
+        if (op == 3) payload.unmap.operation = AMDGPU_VA_OP_UNMAP;
         if (op == 4) payload.create.args.in.op = AMDGPU_USERQ_OP_CREATE;
         fail_in = true;
         assert(amdgpu_salkim_ioctl(&dev, &req, &filp) == -EFAULT);
