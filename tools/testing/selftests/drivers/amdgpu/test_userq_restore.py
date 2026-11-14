@@ -387,6 +387,7 @@ static void *test_range_alloc(size_t size)
     return ptr;
 }
 #define kzalloc_obj(value) test_range_alloc(sizeof(value))
+#define kvmalloc_objs(obj, count) kvmalloc_array((count), sizeof(obj), GFP_KERNEL)
 static void *kvmalloc_array(size_t count, size_t size, unsigned flags)
 {
     assert(!device.notifier_lock && !fpriv.vm.individual_lock);

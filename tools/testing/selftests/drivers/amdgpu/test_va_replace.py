@@ -17,7 +17,9 @@ class VaReplaceTests(unittest.TestCase):
     def test_surviving_mappings_and_completion(self):
         source = (AMD / 'amdgpu_gem.c').read_text()
         names = ('amdgpu_gem_va_batch_boundary', 'amdgpu_gem_va_update_fence',
-                 'amdgpu_gem_va_update_vm', 'amdgpu_gem_va_flags_valid', 'amdgpu_gem_va_ioctl')
+                 'amdgpu_gem_va_update_vm', 'amdgpu_gem_va_flags_valid',
+                 'amdgpu_gem_va_ioctl_internal', 'amdgpu_gem_va_ioctl',
+                 'amdgpu_gem_va_unmap_ioctl')
         functions = []
         for name in names:
             match = re.search(r'^(?:static )?(?:int|bool|struct \w+ \*)\s*' + name
@@ -50,7 +52,7 @@ HARNESS = r'''
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "amdgpu_drm.h"
+#include "amdgpu_salkim.h"
 typedef uint64_t u64;
 typedef uint32_t u32;
 #define AMDGPU_GPU_PAGE_SIZE 4096ULL
@@ -271,41 +273,56 @@ static struct drm_amdgpu_gem_va reset(void)
         .vm_timeline_syncobj_out = 1, .vm_timeline_point = UINT64_C(0x100000001),
     };
 }
-static int invoke(struct drm_amdgpu_gem_va *args)
+static int invoke_mode(struct drm_amdgpu_gem_va *args, bool explicit_sync)
 {
     struct drm_file file = {.driver_priv = &private};
     struct drm_device dev = {0};
-    int result = amdgpu_gem_va_ioctl(&dev, args, &file);
+    int result = explicit_sync ? amdgpu_gem_va_unmap_ioctl(&dev, args, &file) :
+        amdgpu_gem_va_ioctl(&dev, args, &file);
     assert(!pd_locked && !syncobj.refs && !merged.refs && !stub.refs);
     for (unsigned i = 0; i < 3; ++i)
         assert(!bos[i].tbo.base.refs && !bos[i].tbo.base.locked);
     ++cases;
     return result;
 }
+static int invoke(struct drm_amdgpu_gem_va *args) { return invoke_mode(args, false); }
 int main(void)
 {
     for (unsigned explicit_sync = 0; explicit_sync < 2; ++explicit_sync) {
         struct drm_amdgpu_gem_va a = reset();
         a.operation = AMDGPU_VA_OP_UNMAP;
-        a.flags = explicit_sync ? AMDGPU_VM_UNMAP_EXPLICIT_SYNC : 0;
-        assert(!invoke(&a) && mutated && unmap_explicit == !!explicit_sync);
+        a.flags = 0;
+        assert(!invoke_mode(&a, explicit_sync) && mutated && unmap_explicit == !!explicit_sync);
         assert(published == 1 && (published_mask & 3) == 3 && !lookups);
         a = reset(); a.operation = AMDGPU_VA_OP_UNMAP;
-        a.flags = AMDGPU_VM_DELAY_UPDATE | (explicit_sync ? AMDGPU_VM_UNMAP_EXPLICIT_SYNC : 0);
+        a.flags = AMDGPU_VM_DELAY_UPDATE;
         a.vm_timeline_syncobj_out = 0;
-        assert(!invoke(&a) && mutated && unmap_explicit == !!explicit_sync);
+        assert(!invoke_mode(&a, explicit_sync) && mutated && unmap_explicit == !!explicit_sync);
         assert(!clear_updates && !pde_updates && !published);
     }
     for (unsigned operation = AMDGPU_VA_OP_MAP; operation <= AMDGPU_VA_OP_REPLACE; ++operation) {
         if (operation == AMDGPU_VA_OP_UNMAP) continue;
         struct drm_amdgpu_gem_va a = reset();
-        a.operation = operation; a.flags = AMDGPU_VM_UNMAP_EXPLICIT_SYNC;
-        assert(invoke(&a) == -EINVAL && !mutated && !lock_calls);
+        a.operation = operation; a.flags = 0;
+        assert(invoke_mode(&a, true) == -EINVAL && !mutated && !lock_calls);
     }
     {
         struct drm_amdgpu_gem_va a = reset();
         a.operation = AMDGPU_VA_OP_UNMAP;
-        a.flags = AMDGPU_VM_UNMAP_EXPLICIT_SYNC | AMDGPU_VM_PAGE_READABLE;
+        a.flags = AMDGPU_VM_PAGE_READABLE;
+        assert(invoke_mode(&a, true) == -EINVAL && !mutated && !lock_calls);
+    }
+
+    {
+        struct drm_amdgpu_gem_va a = reset();
+        a.operation = AMDGPU_VA_OP_UNMAP; a.flags = 0; a._pad = 1;
+        assert(invoke_mode(&a, true) == -EINVAL && !mutated && !lock_calls);
+    }
+
+    /* The old private bit must not activate explicit unmap on standard GEM_VA. */
+    for (unsigned operation = AMDGPU_VA_OP_MAP; operation <= AMDGPU_VA_OP_REPLACE; ++operation) {
+        struct drm_amdgpu_gem_va a = reset();
+        a.operation = operation; a.flags = 1u << 10;
         assert(invoke(&a) == -EINVAL && !mutated && !lock_calls);
     }
 

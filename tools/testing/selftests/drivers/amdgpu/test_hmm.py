@@ -106,6 +106,7 @@ static void amdgpu_bo_unref(struct amdgpu_bo **bo) {
         (*bo)->refs--;
     *bo = NULL;
 }
+#define kvmalloc_objs(obj, count) kvmalloc_array((count), sizeof(obj), GFP_KERNEL)
 static void *kvmalloc_array(size_t n, size_t size, int flags) {
     assert(!notifier_locked);
     if (fail_alloc)

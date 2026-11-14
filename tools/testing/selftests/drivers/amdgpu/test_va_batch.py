@@ -8,7 +8,8 @@ import subprocess
 import tempfile
 import unittest
 
-ROOT = pathlib.Path(os.environ.get('VA_BATCH_TEST_ROOT', pathlib.Path(__file__).resolve().parents[5]))
+ROOT = (pathlib.Path(os.environ['VA_BATCH_TEST_ROOT']) if 'VA_BATCH_TEST_ROOT' in os.environ
+        else pathlib.Path(__file__).resolve().parents[5])
 AMD = ROOT / 'drivers/gpu/drm/amd/amdgpu'
 
 
@@ -184,12 +185,12 @@ struct amdgpu_vm {
     struct { struct amdgpu_bo *bo; } root;
     struct dma_fence *last_update, *last_tlb_inv, *last_bind;
     unsigned va; struct { struct list_head needs_update; } kernel;
-    struct list_head freed;
+    struct list_head freed, freed_explicit;
     struct amdgpu_vm_batch_state *batch_state;
     u64 tlb_seq;
 };
 struct amdgpu_device { bool debug_vm, userq; void *dev; struct { u64 max_pfn; } vm_manager; };
-struct drm_device { struct amdgpu_device *adev; };
+struct drm_device { struct amdgpu_device *adev; void *dev; };
 struct amdgpu_fpriv { struct amdgpu_vm vm; struct amdgpu_bo_va *prt_va; };
 struct drm_file { struct amdgpu_fpriv *driver_priv; };
 struct drm_syncobj { _Atomic unsigned refs; u64 point; struct dma_fence *fence; struct dma_fence_chain *chain; };
@@ -229,6 +230,25 @@ static struct drm_syncobj syncobjs[2];
 static struct drm_amdgpu_gem_va_batch_op operations[AMDGPU_GEM_VA_BATCH_MAX_OPS];
 static struct drm_amdgpu_gem_va_batch_op applied[AMDGPU_GEM_VA_BATCH_MAX_OPS * 2];
 static pthread_mutex_t vm_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static int resume_error;
+static _Atomic unsigned pm_attempts, pm_gets, pm_puts;
+static _Thread_local bool pm_held;
+static int resume_device(void *dev)
+{
+    assert(!pm_held); pm_attempts++;
+    if (resume_error) return resume_error;
+    pm_held = true; pm_gets++;
+    return 0;
+}
+static void release_device(int *error)
+{
+    if (*error) { assert(!pm_held); return; }
+    assert(pm_held); pm_held = false; pm_puts++;
+}
+#define PM_RUNTIME_ACQUIRE_IF_ENABLED_AUTOSUSPEND(dev, name) \
+    int name __attribute__((cleanup(release_device))) = resume_device(dev)
+#define PM_RUNTIME_ACQUIRE_ERR(lock) (*(lock))
 
 static void mutex_init(struct mutex *m) { assert(!pthread_mutex_init(&m->value, NULL)); }
 static void mutex_lock(struct mutex *m) { assert(!pthread_mutex_lock(&m->value)); }
@@ -522,7 +542,8 @@ ACTUAL_FUNCTIONS
 
 static void setup(bool userq)
 {
-    assert(!live_allocations && !locked);
+    assert(!live_allocations && !locked && !pm_held);
+    resume_error = 0; pm_attempts = pm_gets = pm_puts = 0;
     allocation_count = fail_allocation = mutations = published = update_stage = 0;
     lookup_fail = lock_fail = syncobj_fail = failure_stage = tlb_failure = dependency_stage = 0;
     preparation_allocations = bind_bos = locked_handles = updated_handles = 0;
@@ -562,7 +583,8 @@ static void setup(bool userq)
 }
 static void cleanup(void)
 {
-    assert(!locked && first_syncobj.refs == 1 && syncobjs[1].refs == 1);
+    assert(!locked && !pm_held && pm_gets == pm_puts);
+    assert(first_syncobj.refs == 1 && syncobjs[1].refs == 1);
     for (unsigned i = 0; i < 2; i++) { dma_fence_put(syncobjs[i].fence); dma_fence_chain_free(syncobjs[i].chain); }
     for (unsigned i = 0; i < ARRAY_SIZE(reservations); i++) dma_fence_put(reservations[i].fence);
     amdgpu_vm_batch_fini(&priv.vm);
@@ -587,6 +609,34 @@ static struct drm_amdgpu_gem_va_batch request(bool timeline)
     return a;
 }
 static int run(struct drm_amdgpu_gem_va_batch *a) { return amdgpu_gem_va_batch_ioctl(&drm, a, &file); }
+static void runtime_pm_tests(void)
+{
+    const int errors[] = {-EIO, -EBUSY, -ENOMEM};
+    for (unsigned timeline = 0; timeline < 2; timeline++) {
+        for (unsigned i = 0; i < ARRAY_SIZE(errors); i++) {
+            setup(timeline);
+            struct drm_amdgpu_gem_va_batch a = request(timeline);
+            resume_error = errors[i];
+            assert(run(&a) == errors[i]);
+            assert(pm_attempts == 1 && !pm_gets && !pm_puts);
+            assert(!allocation_count && !mutations && !published && !locked_handles);
+            assert(!first_syncobj.point && !first_syncobj.fence);
+            cleanup();
+        }
+        setup(timeline);
+        struct drm_amdgpu_gem_va_batch a = request(timeline);
+        assert(!run(&a));
+        assert(pm_gets == 1 && pm_puts == 1 && mutations == 3);
+        cleanup();
+    }
+    setup(true);
+    struct drm_amdgpu_gem_va_batch a = request(true);
+    priv.vm.ready = false;
+    assert(run(&a) == -EBUSY);
+    assert(pm_gets == 1 && pm_puts == 1 && !mutations && !published);
+    cleanup();
+}
+
 static void legacy_tests(void)
 {
     setup(false); struct drm_amdgpu_gem_va_batch a = request(false);
@@ -1088,7 +1138,7 @@ static void query_tests(void)
         bool legacy = timeline && !userq && !mapped_userq;
         assert(caps.magic == AMDGPU_SALKIM_MAGIC && caps.abi == AMDGPU_SALKIM_ABI);
         assert(caps.size == sizeof(caps));
-        assert(caps.features == (0 |
+        assert(caps.features == (AMDGPU_SALKIM_CAP_EXPLICIT_UNMAP |
             (timeline ? AMDGPU_SALKIM_CAP_BATCH_TIMELINE : 0) |
             (legacy ? AMDGPU_SALKIM_CAP_BATCH_LEGACY : 0)));
         assert(caps.max_ops == (timeline ? AMDGPU_GEM_VA_BATCH_MAX_OPS : 0));
@@ -1231,6 +1281,7 @@ int main(void)
 {
     for (unsigned backend = 0; backend < 2; ++backend) {
         test_cpu_updates = backend;
+        runtime_pm_tests();
         legacy_tests();
         timeline_tests();
         validation_tests();
