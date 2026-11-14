@@ -678,24 +678,6 @@ int amdgpu_info_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
 		return -EINVAL;
 
 	switch (info->query) {
-	case AMDGPU_INFO_GEM_VA_BATCH: {
-		bool timeline = info->gem_va_batch.flags & AMDGPU_GEM_VA_BATCH_VM_TIMELINE;
-		struct drm_amdgpu_info_gem_va_batch caps = {
-			.cookie = AMDGPU_GEM_VA_BATCH_COOKIE,
-			.max_ops = AMDGPU_GEM_VA_BATCH_MAX_OPS,
-		};
-
-		if ((info->gem_va_batch.flags & ~AMDGPU_GEM_VA_BATCH_VM_TIMELINE) ||
-		    info->gem_va_batch.pad)
-			return -EINVAL;
-		fpriv = filp->driver_priv;
-		if (!amdgpu_gem_va_batch_supported(adev, &fpriv->vm, timeline))
-			return -EOPNOTSUPP;
-		caps.features = AMDGPU_GEM_VA_BATCH_WAIT_COMPLETE |
-				AMDGPU_GEM_VA_BATCH_VM_TIMELINE;
-		return copy_to_user(out, &caps, min_t(u32, size, sizeof(caps))) ?
-			-EFAULT : 0;
-	}
 	case AMDGPU_INFO_ACCEL_WORKING:
 		ui32 = adev->accel_working;
 		return copy_to_user(out, &ui32, min(size, 4u)) ? -EFAULT : 0;
@@ -1007,7 +989,6 @@ int amdgpu_info_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
 		dev_info->num_rb_pipes = adev->gfx.config.max_backends_per_se *
 			adev->gfx.config.max_shader_engines;
 		dev_info->num_hw_gfx_contexts = adev->gfx.config.max_hw_contexts;
-		dev_info->ids_flags = AMDGPU_IDS_FLAGS_VM_UNMAP_EXPLICIT_SYNC;
 		if (adev->flags & AMD_IS_APU)
 			dev_info->ids_flags |= AMDGPU_IDS_FLAGS_FUSION;
 		if (adev->gfx.mcbp)
