@@ -36,6 +36,7 @@
 #include <linux/pm_runtime.h>
 
 #include <drm/amdgpu_drm.h>
+#include <drm/amdgpu_salkim.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_exec.h>
 #include <drm/drm_gem_ttm_helper.h>
@@ -902,16 +903,11 @@ static bool amdgpu_gem_va_flags_valid(u32 operation, u32 flags)
 	const uint32_t prt_flags = AMDGPU_VM_DELAY_UPDATE |
 		AMDGPU_VM_PAGE_PRT;
 
-	if (flags & AMDGPU_VM_UNMAP_EXPLICIT_SYNC)
-		return operation == AMDGPU_VA_OP_UNMAP &&
-			!(flags & ~(AMDGPU_VM_UNMAP_EXPLICIT_SYNC |
-				     AMDGPU_VM_DELAY_UPDATE));
-
 	return !(flags & ~valid_flags) || !(flags & ~prt_flags);
 }
 
-int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
-			struct drm_file *filp)
+static int amdgpu_gem_va_ioctl_internal(struct drm_device *dev, void *data,
+					struct drm_file *filp, bool explicit_unmap)
 {
 	struct drm_amdgpu_gem_va *args = data;
 	struct drm_gem_object *gobj;
@@ -1081,7 +1077,7 @@ int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
 		break;
 	case AMDGPU_VA_OP_UNMAP:
 		r = amdgpu_vm_bo_unmap(adev, bo_va, args->va_address,
-				       args->flags & AMDGPU_VM_UNMAP_EXPLICIT_SYNC);
+				       explicit_unmap);
 		break;
 
 	case AMDGPU_VA_OP_CLEAR:
@@ -1135,6 +1131,24 @@ error:
 error_put_gobj:
 	drm_gem_object_put(gobj);
 	return r;
+}
+
+int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
+			struct drm_file *filp)
+{
+	return amdgpu_gem_va_ioctl_internal(dev, data, filp, false);
+}
+
+int amdgpu_gem_va_unmap_ioctl(struct drm_device *dev, void *data,
+			      struct drm_file *filp)
+{
+	struct drm_amdgpu_gem_va *args = data;
+
+	if (args->_pad || args->operation != AMDGPU_VA_OP_UNMAP ||
+	    args->flags & ~AMDGPU_VM_DELAY_UPDATE)
+		return -EINVAL;
+
+	return amdgpu_gem_va_ioctl_internal(dev, data, filp, true);
 }
 
 /* Only the legacy mode relies on subsequent kernel command submission. */
@@ -1203,8 +1217,7 @@ int amdgpu_gem_va_batch_ioctl(struct drm_device *dev, void *data,
 	u32 i, j;
 	int r;
 
-	if (args->cookie != AMDGPU_GEM_VA_BATCH_COOKIE ||
-	    (args->flags & ~(AMDGPU_GEM_VA_BATCH_WAIT_COMPLETE |
+	if ((args->flags & ~(AMDGPU_GEM_VA_BATCH_WAIT_COMPLETE |
 			     AMDGPU_GEM_VA_BATCH_VM_TIMELINE)) ||
 	    !args->count || args->count > AMDGPU_GEM_VA_BATCH_MAX_OPS)
 		return -EINVAL;

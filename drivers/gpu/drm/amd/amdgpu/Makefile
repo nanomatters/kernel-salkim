@@ -51,6 +51,8 @@ subdir-ccflags-$(CONFIG_DRM_AMDGPU_WERROR) += -Werror
 amdgpu-y := amdgpu_drv.o
 
 # add KMS driver
+amdgpu-y += amdgpu_salkim.o
+
 amdgpu-y += amdgpu_device.o amdgpu_reg_access.o amdgpu_doorbell_mgr.o amdgpu_kms.o \
 	amdgpu_atombios.o atombios_crtc.o amdgpu_connectors.o \
 	atom.o amdgpu_fence.o amdgpu_ttm.o amdgpu_object.o amdgpu_gart.o \

@@ -60,7 +60,6 @@ extern "C" {
 #define DRM_AMDGPU_GEM_LIST_HANDLES	0x19
 #define DRM_AMDGPU_PROC_OPTIONS		0x1A
 #define DRM_AMDGPU_UALINK_HANDLE	0x1B
-#define DRM_AMDGPU_GEM_VA_BATCH		0x1C
 
 #define DRM_IOCTL_AMDGPU_GEM_CREATE	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDGPU_GEM_CREATE, union drm_amdgpu_gem_create)
 #define DRM_IOCTL_AMDGPU_GEM_MMAP	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDGPU_GEM_MMAP, union drm_amdgpu_gem_mmap)
@@ -84,90 +83,6 @@ extern "C" {
 #define DRM_IOCTL_AMDGPU_GEM_LIST_HANDLES DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDGPU_GEM_LIST_HANDLES, struct drm_amdgpu_gem_list_handles)
 #define DRM_IOCTL_AMDGPU_PROC_OPTIONS	DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDGPU_PROC_OPTIONS, struct drm_amdgpu_proc_options)
 #define DRM_IOCTL_AMDGPU_UALINK_HANDLE DRM_IOWR(DRM_COMMAND_BASE + DRM_AMDGPU_UALINK_HANDLE, union drm_amdgpu_ualink_handle)
-#define DRM_IOCTL_AMDGPU_GEM_VA_BATCH \
-	DRM_IOW(DRM_COMMAND_BASE + DRM_AMDGPU_GEM_VA_BATCH, struct drm_amdgpu_gem_va_batch)
-
-/* Local, versioned ABI: probe INFO first. Never infer support from DRM minor. */
-#define AMDGPU_INFO_GEM_VA_BATCH		0x25
-#define AMDGPU_GEM_VA_BATCH_COOKIE	0x53414c4b56414203ULL
-#define AMDGPU_GEM_VA_BATCH_MAX_OPS	4096
-
-/* The caller has completed the dependencies of the replaced ranges.
- * Eligible retirements may omit implicit rendering waits. CS update waits,
- * movement dependencies and invalidation rules are unchanged.
- */
-#define AMDGPU_GEM_VA_BATCH_WAIT_COMPLETE	(1U << 0)
-
-/* Publish completion of page-table updates and required TLB invalidation.
- * The caller supplies a nonzero output syncobj handle and timeline point.
- */
-#define AMDGPU_GEM_VA_BATCH_VM_TIMELINE	(1U << 1)
-
-struct drm_amdgpu_info_gem_va_batch {
-	__u64 cookie;
-	__u32 max_ops;
-	__u32 reserved;
-	/* Optional extension: zero the query buffer before probing older kernels. */
-	__u64 features;
-};
-
-/* REPLACE operations, in array order. PRT with handle 0 unbinds a range.
- * DELAY_UPDATE is not accepted. The kernel manages pending updates.
- */
-struct drm_amdgpu_gem_va_batch_op {
-	__u32 handle;
-	__u32 flags;
-	__u64 va_address;
-	__u64 offset_in_bo;
-	__u64 map_size;
-};
-
-/* Batched GEM_VA acceptance. Probe INFO and match the cookie before use.
- * Optional flags must be advertised in features. KFD and CPU-updated VMs are
- * not supported. User-queue VMs require VM_TIMELINE.
- *
- * Without VM_TIMELINE, reserved fields must be zero and a negative ioctl return
- * leaves every mapping unchanged. A zero return accepts the entire array,
- * in order. The request is input-only, so no copy-out can fail
- * after acceptance. There is no partial count, secondary status or safe replay
- * of a successful request.
- *
- * Acceptance does not mean GPU completion. As with GEM_VA, page-table updates
- * may remain pending when the VM is evicted or an update fails. The kernel keeps
- * that work for command-submission validation, which must complete preparation
- * successfully before submitting commands. Existing update-fence dependencies
- * and TLB-invalidation rules remain in effect. Persistent update failures are
- * reported by command submission, not by replaying the accepted batch.
- * No userspace semaphore is signaled in this mode.
- *
- * With VM_TIMELINE, zero means all mappings were accepted and the output point
- * was published. Wait for that point before using the mappings. Completion
- * covers every affected BO, page directories and required TLB invalidation.
- * Asynchronous failures remain recorded on the VM. Once observed, they fail
- * later mapping and CS ioctls, scheduler jobs and USERQ_WAIT checks. This does
- * not stop running user queues or clients that bypass USERQ_WAIT.
- * EBUSY means the VM or a target BO is not resident and nothing was changed.
- * EIO is terminal. Mappings may already have changed and the request must not
- * be replayed or followed by GPU work using this VM. Other errors leave mappings
- * unchanged. No point is published on an ioctl error. The caller must serialize
- * updates to its output timeline and advance the point only on success.
- * The WAIT_COMPLETE flag retains its independent meaning in both modes.
- */
-struct drm_amdgpu_gem_va_batch {
-	__u64 cookie;
-	__u64 operations;
-	__u32 count;
-	__u32 flags;
-	union {
-		__u64 reserved[2];
-		struct {
-			__u32 vm_timeline_syncobj_out;
-			__u32 pad;
-			__u64 vm_timeline_point;
-		};
-	};
-};
-
 /**
  * DOC: memory domains
  *
@@ -974,15 +889,6 @@ struct drm_amdgpu_gem_list_handles_entry {
 /* Delay the page table update till the next CS */
 #define AMDGPU_VM_DELAY_UPDATE		(1 << 0)
 
-/*
- * UNMAP only: userspace has completed every access through this VA mapping.
- * Skip rendering dependencies for its retirement, but retain memory movement,
- * page-table update and TLB invalidation ordering. Can be combined only with
- * AMDGPU_VM_DELAY_UPDATE. This does not make the unmap complete synchronously.
- * Query AMDGPU_IDS_FLAGS_VM_UNMAP_EXPLICIT_SYNC before using this flag.
- */
-#define AMDGPU_VM_UNMAP_EXPLICIT_SYNC	(1 << 10)
-
 /* Mapping flags */
 /* readable mapping */
 #define AMDGPU_VM_PAGE_READABLE		(1 << 1)
@@ -1200,7 +1106,6 @@ struct drm_amdgpu_cs_chunk_cp_gfx_shadow {
 #define AMDGPU_IDS_FLAGS_TMZ			0x04
 #define AMDGPU_IDS_FLAGS_CONFORMANT_TRUNC_COORD	0x08
 #define AMDGPU_IDS_FLAGS_GANG_SUBMIT		0x10
-#define AMDGPU_IDS_FLAGS_VM_UNMAP_EXPLICIT_SYNC	0x20
 
 /*
  *  Query h/w info: Flag identifying VF/PF/PT mode
@@ -1421,11 +1326,6 @@ struct drm_amdgpu_info {
 			__u32 _pad;
 		} mode_crtc;
 
-		struct {
-			/* Zero probes legacy batches. VM_TIMELINE opts into that mode. */
-			__u32 flags;
-			__u32 pad;
-		} gem_va_batch;
 
 		struct {
 			/** AMDGPU_HW_IP_* */

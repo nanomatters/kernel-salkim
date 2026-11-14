@@ -33,6 +33,7 @@
 #include <drm/drm_vblank.h>
 
 #include <linux/cc_platform.h>
+#include <linux/compat.h>
 #include <linux/dynamic_debug.h>
 #include <linux/module.h>
 #include <linux/mmu_notifier.h>
@@ -41,6 +42,7 @@
 #include <linux/vga_switcheroo.h>
 
 #include "amdgpu.h"
+#include "amdgpu_salkim.h"
 #include "amdgpu_amdkfd.h"
 #include "amdgpu_dma_buf.h"
 #include "amdgpu_drv.h"
@@ -3069,17 +3071,37 @@ static int amdgpu_flush(struct file *f, fl_owner_t id)
 	return timeout >= 0 ? 0 : timeout;
 }
 
+static long amdgpu_drm_ioctl(struct file *filp, unsigned int cmd,
+			     unsigned long arg)
+{
+	if (cmd == AMDGPU_SALKIM_IOCTL)
+		return amdgpu_salkim_dispatch(filp, arg);
+
+	return drm_ioctl(filp, cmd, arg);
+}
+
+#ifdef CONFIG_COMPAT
+static long amdgpu_kms_compat_ioctl(struct file *filp, unsigned int cmd,
+				    unsigned long arg)
+{
+	if (cmd == AMDGPU_SALKIM_IOCTL)
+		return amdgpu_salkim_dispatch(filp, (unsigned long)compat_ptr(arg));
+
+	return drm_compat_ioctl(filp, cmd, arg);
+}
+#endif
+
 static const struct file_operations amdgpu_driver_kms_fops = {
 	.owner = THIS_MODULE,
 	.open = drm_open,
 	.flush = amdgpu_flush,
 	.release = amdgpu_drm_release,
-	.unlocked_ioctl = drm_ioctl,
+	.unlocked_ioctl = amdgpu_drm_ioctl,
 	.mmap = drm_gem_mmap,
 	.poll = drm_poll,
 	.read = drm_read,
 #ifdef CONFIG_COMPAT
-	.compat_ioctl = drm_compat_ioctl,
+	.compat_ioctl = amdgpu_kms_compat_ioctl,
 #endif
 #ifdef CONFIG_PROC_FS
 	.show_fdinfo = drm_show_fdinfo,
@@ -3118,8 +3140,6 @@ const struct drm_ioctl_desc amdgpu_ioctls_kms[] = {
 	DRM_IOCTL_DEF_DRV(AMDGPU_WAIT_FENCES, amdgpu_cs_wait_fences_ioctl, DRM_AUTH|DRM_RENDER_ALLOW),
 	DRM_IOCTL_DEF_DRV(AMDGPU_GEM_METADATA, amdgpu_gem_metadata_ioctl, DRM_AUTH|DRM_RENDER_ALLOW),
 	DRM_IOCTL_DEF_DRV(AMDGPU_GEM_VA, amdgpu_gem_va_ioctl, DRM_AUTH|DRM_RENDER_ALLOW),
-	DRM_IOCTL_DEF_DRV(AMDGPU_GEM_VA_BATCH, amdgpu_gem_va_batch_ioctl,
-			  DRM_AUTH | DRM_RENDER_ALLOW),
 	DRM_IOCTL_DEF_DRV(AMDGPU_GEM_OP, amdgpu_gem_op_ioctl, DRM_AUTH|DRM_RENDER_ALLOW),
 	DRM_IOCTL_DEF_DRV(AMDGPU_GEM_USERPTR, amdgpu_gem_userptr_ioctl, DRM_AUTH|DRM_RENDER_ALLOW),
 	DRM_IOCTL_DEF_DRV(AMDGPU_USERQ, amdgpu_userq_ioctl, DRM_AUTH|DRM_RENDER_ALLOW),
