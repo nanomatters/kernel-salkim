@@ -31,12 +31,37 @@ def run(program, sources=()):
 
 
 class BoPriorityTests(unittest.TestCase):
+    def test_native_bo_list_priority(self):
+        source = (AMD / 'amdgpu_bo_list.c').read_text()
+        comparator = function(source, 'amdgpu_bo_list_entry_cmp')
+        run(NATIVE.replace('ACTUAL_SOURCE', comparator))
+
     def test_evicted_placement_order(self):
         source = (AMD / 'amdgpu_vm.c').read_text()
         functions = '\n'.join(function(source, name) for name in (
             'amdgpu_vm_bo_evicted', 'amdgpu_vm_bo_needs_update',
             'amdgpu_vm_evicted_priority_cmp', 'amdgpu_vm_validate'))
         run(VM.replace('ACTUAL_SOURCE', functions), [str(ROOT / 'tools/lib/list_sort.c')])
+
+
+NATIVE = r'''
+#include <assert.h>
+#include <limits.h>
+#include <stdlib.h>
+#define BUILD_BUG_ON(condition) _Static_assert(!(condition), #condition)
+#define AMDGPU_BO_LIST_MAX_PRIORITY 32u
+struct amdgpu_bo_list_entry { unsigned priority; };
+ACTUAL_SOURCE
+int main(void)
+{
+    struct amdgpu_bo_list_entry bos[] = {{0}, {14}, {32}, {14}, {1}};
+    const unsigned expected[] = {32, 14, 14, 1, 0};
+    assert(!amdgpu_bo_list_entry_cmp(&bos[1], &bos[3]));
+    qsort(bos, 5, sizeof(*bos), amdgpu_bo_list_entry_cmp);
+    for (unsigned i = 0; i < 5; i++)
+        assert(bos[i].priority == expected[i]);
+}
+'''
 
 
 VM = r'''
