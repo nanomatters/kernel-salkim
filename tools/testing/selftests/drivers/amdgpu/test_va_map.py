@@ -70,7 +70,7 @@ static void list_del(struct list_head *node)
 static bool list_empty(const struct list_head *head) { return head->next == head; }
 struct drm_gem_object { bool imported; };
 struct amdgpu_bo {
-    bool always_valid; uint64_t size;
+    bool always_valid, vm_priority_locked; uint64_t size;
     struct { struct drm_gem_object base; void *ttm; } tbo;
 };
 struct amdgpu_vm;
@@ -83,6 +83,8 @@ struct amdgpu_bo_va_mapping {
 };
 struct interval_tree { unsigned count; struct amdgpu_bo_va_mapping *items[32]; };
 struct amdgpu_vm { struct interval_tree va; };
+static bool amdgpu_vm_is_bo_always_valid(struct amdgpu_vm *vm, struct amdgpu_bo *bo)
+{ return bo && bo->always_valid; }
 struct amdgpu_device { struct { uint64_t max_pfn; } vm_manager; };
 static bool vm_locked;
 static unsigned live_allocations, allocations, prt_gets, traces, cases;
@@ -164,6 +166,8 @@ static void map_range(unsigned owner, uint64_t start, uint64_t last, uint64_t of
     struct amdgpu_bo_va_mapping *mapping = allocate(sizeof(*mapping));
     unsigned count = allocations;
     amdgpu_vm_bo_map_prealloc(&device, bo_va, address, offset, size, flags, mapping);
+    if (bo_va->base.bo)
+        assert(bo_va->base.bo->vm_priority_locked == bo_va->base.bo->always_valid);
     assert(allocations == count);
     for (uint64_t i = start; i <= last; i++) {
         assert(!expected[i].owner);

@@ -1089,6 +1089,7 @@ static void query_tests(void)
         assert(caps.magic == AMDGPU_SALKIM_MAGIC && caps.abi == AMDGPU_SALKIM_ABI);
         assert(caps.size == sizeof(caps));
         assert(caps.features == (AMDGPU_SALKIM_CAP_EXPLICIT_UNMAP |
+            AMDGPU_SALKIM_CAP_BO_INITIAL_PRIORITY |
             (timeline ? AMDGPU_SALKIM_CAP_BATCH_TIMELINE : 0) |
             (legacy ? AMDGPU_SALKIM_CAP_BATCH_LEGACY : 0)));
         assert(caps.max_ops == (timeline ? AMDGPU_GEM_VA_BATCH_MAX_OPS : 0));

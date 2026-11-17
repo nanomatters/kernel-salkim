@@ -44,7 +44,7 @@ class SalkimUapiTests(unittest.TestCase):
         source = (AMD / 'amdgpu_salkim.c').read_text()
         actual = '\n'.join(function(source, name) for name in (
             'amdgpu_salkim_validate_request', 'amdgpu_salkim_get_caps',
-            'amdgpu_salkim_ioctl', 'amdgpu_salkim_dispatch'))
+            'amdgpu_salkim_bo_initial_priority', 'amdgpu_salkim_ioctl', 'amdgpu_salkim_dispatch'))
         with tempfile.TemporaryDirectory(prefix='salkim-dispatch-') as temporary:
             path = pathlib.Path(temporary)
             (path / 'test.c').write_text(HARNESS.replace('ACTUAL_SOURCE', actual))
@@ -91,6 +91,8 @@ _Static_assert(sizeof(struct drm_amdgpu_salkim_request) == 32, "envelope size");
 _Static_assert(offsetof(struct drm_amdgpu_salkim_request, payload) == 16, "payload pointer");
 _Static_assert(offsetof(struct drm_amdgpu_salkim_request, payload_size) == 24, "payload size");
 _Static_assert(sizeof(struct drm_amdgpu_salkim_caps) == 64, "capability size");
+_Static_assert(sizeof(struct drm_amdgpu_salkim_bo_initial_priority) == 8, "BO hint");
+_Static_assert(offsetof(struct drm_amdgpu_salkim_bo_initial_priority, priority) == 4, "BO priority");
 _Static_assert(offsetof(struct drm_amdgpu_salkim_caps, features) == 16, "feature bits");
 _Static_assert(offsetof(struct drm_amdgpu_salkim_caps, reserved) == 40, "future extension");
 _Static_assert(offsetof(struct drm_amdgpu_salkim_userq_create, relative_priority) ==
@@ -150,7 +152,7 @@ typedef uint32_t u32;
 #define DRM_AUTH 1
 #define DRM_RENDER_ALLOW 2
 #define u64_to_user_ptr(value) ((void *)(uintptr_t)(value))
-struct amdgpu_vm { int unused; };
+struct amdgpu_vm { bool sort_evicted; };
 struct amdgpu_fpriv { struct amdgpu_vm vm; };
 struct amdgpu_device { int unused; };
 struct drm_device { struct amdgpu_device adev; };
@@ -158,6 +160,38 @@ struct drm_file { struct amdgpu_fpriv *driver_priv; };
 struct file { struct drm_device *dev; struct drm_file *private_data; };
 #define drm_to_adev(dev) (&(dev)->adev)
 static unsigned copies_in, copies_out, batch_calls, unmap_calls, create_calls, free_calls;
+static unsigned looked_up, put;
+static bool reservation;
+struct drm_gem_object { bool *resv; };
+struct amdgpu_bo {
+    struct drm_gem_object gem;
+    struct { int type; } tbo;
+    struct amdgpu_vm *vm;
+    unsigned flags;
+    int8_t vm_priority_offset;
+    bool vm_priority_locked;
+};
+static struct amdgpu_bo bo;
+enum { ttm_bo_type_device, ttm_bo_type_kernel, ttm_bo_type_sg };
+#define gem_to_amdgpu_bo(obj) ((struct amdgpu_bo *)(obj))
+static struct drm_gem_object *drm_gem_object_lookup(struct drm_file *filp, u32 handle)
+{
+    if (handle != 19) return NULL;
+    ++looked_up;
+    return &bo.gem;
+}
+static void drm_gem_object_put(struct drm_gem_object *obj)
+{ assert(obj == &bo.gem && put < looked_up); ++put; }
+static bool amdgpu_vm_is_bo_always_valid(struct amdgpu_vm *vm, struct amdgpu_bo *obj)
+{ return vm == obj->vm; }
+static int lock_error;
+static int dma_resv_lock_interruptible(bool *resv, void *ticket)
+{
+    assert(resv == &reservation && !*resv);
+    if (!lock_error) *resv = true;
+    return lock_error;
+}
+static void dma_resv_unlock(bool *resv) { assert(*resv); *resv = false; }
 static int backend_result, permit_result;
 static bool fail_in, fail_out, mutate_user_request;
 static struct drm_amdgpu_salkim_request *userspace_request;
@@ -264,9 +298,10 @@ int main(void)
         struct drm_amdgpu_gem_va_batch batch;
         struct drm_amdgpu_gem_va unmap;
         struct drm_amdgpu_salkim_userq_create create;
+        struct drm_amdgpu_salkim_bo_initial_priority priority;
     } payload = {0};
     const unsigned sizes[] = {0, sizeof(payload.caps), sizeof(payload.batch),
-                             sizeof(payload.unmap), sizeof(payload.create)};
+                             sizeof(payload.unmap), sizeof(payload.create), 0, sizeof(payload.priority)};
     struct drm_amdgpu_salkim_request req = {.magic = AMDGPU_SALKIM_MAGIC,
         .abi = AMDGPU_SALKIM_ABI, .op = AMDGPU_SALKIM_OP_CAPS,
         .payload = (uintptr_t)&payload, .payload_size = sizeof(payload.caps)};
@@ -283,7 +318,8 @@ int main(void)
     req = good; req.payload = 0;
     assert(amdgpu_salkim_ioctl(&dev, &req, &filp) == -EINVAL);
     no_backend(); assert(!copies_in && !copies_out);
-    for (unsigned op = 1; op <= 4; ++op) {
+    for (unsigned op = 1; op < sizeof(sizes) / sizeof(sizes[0]); ++op) {
+        if (!sizes[op]) continue;
         req = good; req.op = op;
         for (unsigned size = 0; size < sizes[op]; ++size) {
             req.payload_size = size;
@@ -306,6 +342,7 @@ int main(void)
     assert(!amdgpu_salkim_dispatch(&file, (uintptr_t)&req));
     assert(payload.caps.magic == AMDGPU_SALKIM_MAGIC && payload.caps.abi == AMDGPU_SALKIM_ABI);
     assert(payload.caps.size == sizeof(payload.caps));
+    assert(payload.caps.features & AMDGPU_SALKIM_CAP_BO_INITIAL_PRIORITY);
     assert(payload.caps.relative_priority_ip_mask == BIT(AMDGPU_HW_IP_GFX));
     for (unsigned i = 0; i < 3; ++i) assert(!payload.caps.reserved[i]);
     no_backend(); assert(copies_in == 1 && copies_out == 1);
@@ -350,6 +387,47 @@ int main(void)
     assert(!amdgpu_salkim_ioctl(&dev, &req, &filp));
     assert(payload.create.args.out.queue_id == 123 && create_calls == 1 && !free_calls);
     assert(created.refs == 1);
+    reset_counters(); memset(&payload, 0, sizeof(payload));
+    req = good; req.op = AMDGPU_SALKIM_OP_BO_INITIAL_PRIORITY;
+    req.payload_size = sizeof(payload.priority) + 1;
+    payload.bytes[sizeof(payload.priority)] = 1;
+    assert(amdgpu_salkim_dispatch(&file, (uintptr_t)&req) == -E2BIG);
+    assert(!looked_up);
+    payload.bytes[sizeof(payload.priority)] = 0;
+    assert(amdgpu_salkim_dispatch(&file, (uintptr_t)&req) == -ENOENT);
+    payload.priority.handle = 19;
+    payload.priority.priority = AMDGPU_SALKIM_BO_PRIORITY_MAX + 1;
+    assert(amdgpu_salkim_dispatch(&file, (uintptr_t)&req) == -EINVAL);
+    assert(!looked_up);
+    payload.priority.priority = AMDGPU_SALKIM_BO_PRIORITY_MAX;
+    bo.gem.resv = &reservation;
+    assert(amdgpu_salkim_dispatch(&file, (uintptr_t)&req) == -EINVAL); /* wrong VM */
+    bo.vm = &fpriv.vm;
+    assert(amdgpu_salkim_dispatch(&file, (uintptr_t)&req) == -EINVAL); /* missing flag */
+    bo.flags = AMDGPU_GEM_CREATE_VM_ALWAYS_VALID;
+    bo.tbo.type = ttm_bo_type_sg;
+    assert(amdgpu_salkim_dispatch(&file, (uintptr_t)&req) == -EINVAL);
+    bo.tbo.type = ttm_bo_type_kernel;
+    assert(amdgpu_salkim_dispatch(&file, (uintptr_t)&req) == -EINVAL);
+    bo.tbo.type = ttm_bo_type_device;
+    lock_error = -EINTR;
+    assert(amdgpu_salkim_dispatch(&file, (uintptr_t)&req) == -EINTR);
+    assert(!bo.vm_priority_locked && !bo.vm_priority_offset && !fpriv.vm.sort_evicted);
+    lock_error = 0;
+    assert(!amdgpu_salkim_dispatch(&file, (uintptr_t)&req));
+    assert(bo.vm_priority_offset == 17 && fpriv.vm.sort_evicted);
+    fpriv.vm.sort_evicted = false;
+    assert(!amdgpu_salkim_dispatch(&file, (uintptr_t)&req));
+    assert(!fpriv.vm.sort_evicted);
+    payload.priority.priority = 0;
+    assert(amdgpu_salkim_dispatch(&file, (uintptr_t)&req) == -EBUSY);
+    assert(bo.vm_priority_locked && bo.vm_priority_offset == 17);
+    bo.vm_priority_locked = false; /* newly created BO */
+    assert(!amdgpu_salkim_dispatch(&file, (uintptr_t)&req));
+    assert(bo.vm_priority_locked && bo.vm_priority_offset == -14);
+    bo.vm_priority_offset = 0; /* ordinary BO sealed by its first mapping */
+    assert(amdgpu_salkim_dispatch(&file, (uintptr_t)&req) == -EBUSY);
+    assert(!reservation && looked_up == put && !copies_out);
     puts("Private ioctl validation, admission, zero-tail extension, acceptance and copy-fault checks passed");
     return 0;
 }
