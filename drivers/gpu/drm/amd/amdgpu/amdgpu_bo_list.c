@@ -56,7 +56,8 @@ static int amdgpu_bo_list_entry_cmp(const void *_a, const void *_b)
 
 	BUILD_BUG_ON(AMDGPU_BO_LIST_MAX_PRIORITY >= INT_MAX);
 
-	return (int)a->priority - (int)b->priority;
+	/* CS validates in forward order while spending its migration budget. */
+	return (int)b->priority - (int)a->priority;
 }
 
 struct amdgpu_bo_list *
