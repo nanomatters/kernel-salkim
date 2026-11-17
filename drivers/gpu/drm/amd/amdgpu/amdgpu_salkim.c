@@ -26,6 +26,7 @@ static_assert(offsetof(struct drm_amdgpu_gem_va, vm_timeline_point) == 40);
 static_assert(sizeof(union drm_amdgpu_userq) == 72);
 static_assert(sizeof(struct drm_amdgpu_salkim_userq_create) == 80);
 static_assert(offsetof(struct drm_amdgpu_salkim_userq_create, relative_priority) == 72);
+static_assert(sizeof(struct drm_amdgpu_salkim_bo_initial_priority) == 8);
 
 static int amdgpu_salkim_validate_request(const struct drm_amdgpu_salkim_request *request)
 {
@@ -49,6 +50,9 @@ static int amdgpu_salkim_validate_request(const struct drm_amdgpu_salkim_request
 	case AMDGPU_SALKIM_OP_USERQ_CREATE:
 		minimum = sizeof(struct drm_amdgpu_salkim_userq_create);
 		break;
+	case AMDGPU_SALKIM_OP_BO_INITIAL_PRIORITY:
+		minimum = sizeof(struct drm_amdgpu_salkim_bo_initial_priority);
+		break;
 	default:
 		return -ENOTTY;
 	}
@@ -71,7 +75,8 @@ static void amdgpu_salkim_get_caps(struct drm_device *dev, struct drm_file *filp
 		.magic = AMDGPU_SALKIM_MAGIC,
 		.abi = AMDGPU_SALKIM_ABI,
 		.size = sizeof(*caps),
-		.features = AMDGPU_SALKIM_CAP_EXPLICIT_UNMAP,
+		.features = AMDGPU_SALKIM_CAP_EXPLICIT_UNMAP |
+			    AMDGPU_SALKIM_CAP_BO_INITIAL_PRIORITY,
 	};
 	if (amdgpu_gem_va_batch_supported(adev, &fpriv->vm, false))
 		caps->features |= AMDGPU_SALKIM_CAP_BATCH_LEGACY;
@@ -90,6 +95,49 @@ static void amdgpu_salkim_get_caps(struct drm_device *dev, struct drm_file *filp
 		if (amdgpu_userq_supports_relative_priority(adev, ip))
 			caps->relative_priority_ip_mask |= BIT(ip);
 	}
+}
+
+static int amdgpu_salkim_bo_initial_priority(struct drm_file *filp, u32 handle,
+					     u32 priority)
+{
+	struct amdgpu_fpriv *fpriv = filp->driver_priv;
+	struct drm_gem_object *obj;
+	struct amdgpu_bo *bo;
+	int offset, r;
+
+	if (priority > AMDGPU_SALKIM_BO_PRIORITY_MAX)
+		return -EINVAL;
+
+	obj = drm_gem_object_lookup(filp, handle);
+	if (!obj)
+		return -ENOENT;
+
+	bo = gem_to_amdgpu_bo(obj);
+	if (!amdgpu_vm_is_bo_always_valid(&fpriv->vm, bo) ||
+	    bo->tbo.type != ttm_bo_type_device) {
+		r = -EINVAL;
+		goto out;
+	}
+	r = dma_resv_lock_interruptible(obj->resv, NULL);
+	if (r)
+		goto out;
+
+	offset = (int)priority - AMDGPU_SALKIM_BO_PRIORITY_NORMAL;
+	if (!(bo->flags & AMDGPU_GEM_CREATE_VM_ALWAYS_VALID)) {
+		r = -EINVAL;
+	} else if (bo->vm_priority_locked && bo->vm_priority_offset != offset) {
+		r = -EBUSY;
+	} else if (!bo->vm_priority_locked) {
+		bo->vm_priority_offset = offset;
+		bo->vm_priority_locked = true;
+		/* GEM open can already have put this BO on the evicted list. */
+		if (offset)
+			fpriv->vm.sort_evicted = true;
+	}
+	dma_resv_unlock(obj->resv);
+out:
+	drm_gem_object_put(obj);
+	return r;
 }
 
 static int amdgpu_salkim_ioctl(struct drm_device *dev, void *data,
@@ -146,6 +194,14 @@ static int amdgpu_salkim_ioctl(struct drm_device *dev, void *data,
 		}
 		amdgpu_userq_put(queue);
 		return r;
+	}
+	case AMDGPU_SALKIM_OP_BO_INITIAL_PRIORITY: {
+		struct drm_amdgpu_salkim_bo_initial_priority args;
+
+		r = copy_struct_from_user(&args, sizeof(args), payload, request->payload_size);
+		if (r)
+			return r;
+		return amdgpu_salkim_bo_initial_priority(filp, args.handle, args.priority);
 	}
 	default:
 		return -ENOTTY;
