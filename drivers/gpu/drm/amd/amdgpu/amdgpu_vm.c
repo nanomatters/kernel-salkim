@@ -29,6 +29,7 @@
 #include <linux/dma-fence-array.h>
 #include <linux/dma-fence-unwrap.h>
 #include <linux/interval_tree_generic.h>
+#include <linux/list_sort.h>
 #include <linux/idr.h>
 #include <linux/dma-buf.h>
 
@@ -211,6 +212,12 @@ static void amdgpu_vm_bo_evicted(struct amdgpu_vm_bo_base *vm_bo)
 	lists = amdgpu_vm_bo_lock_lists(vm_bo);
 	vm_bo->moved = true;
 	list_move(&vm_bo->vm_status, &lists->evicted);
+	/* Moving to the head can only introduce an inversion at the new head. */
+	if (lists == &vm_bo->vm->always_valid &&
+	    !list_is_last(&vm_bo->vm_status, &lists->evicted) &&
+	    vm_bo->bo->vm_priority_offset <
+	    list_next_entry(vm_bo, vm_status)->bo->vm_priority_offset)
+		vm_bo->vm->sort_evicted = true;
 	amdgpu_vm_bo_unlock_lists(vm_bo);
 }
 /**
@@ -608,6 +615,16 @@ uint64_t amdgpu_vm_generation(struct amdgpu_device *adev, struct amdgpu_vm *vm)
 	return result;
 }
 
+static int amdgpu_vm_evicted_priority_cmp(void *priv, const struct list_head *a,
+					  const struct list_head *b)
+{
+	const struct amdgpu_vm_bo_base *first, *second;
+
+	first = list_entry(a, struct amdgpu_vm_bo_base, vm_status);
+	second = list_entry(b, struct amdgpu_vm_bo_base, vm_status);
+	return second->bo->vm_priority_offset - first->bo->vm_priority_offset;
+}
+
 /**
  * amdgpu_vm_validate - validate evicted BOs tracked in the VM
  *
@@ -668,6 +685,14 @@ int amdgpu_vm_validate(struct amdgpu_device *adev, struct amdgpu_vm *vm,
 	scoped_guard(mutex, &vm->eviction_lock)
 		vm->evicting = false;
 
+	/*
+	 * Give the highest priority evictees the first placement attempts.
+	 * list_sort preserves the existing traversal order between equal hints.
+	 */
+	if (vm->sort_evicted) {
+		list_sort(NULL, &vm->always_valid.evicted, amdgpu_vm_evicted_priority_cmp);
+		vm->sort_evicted = false;
+	}
 	list_for_each_entry_safe(bo_base, tmp, &vm->always_valid.evicted,
 				 vm_status) {
 		r = validate(param, bo_base->bo);
@@ -2119,6 +2144,8 @@ static void amdgpu_vm_bo_insert_map(struct amdgpu_device *adev,
 	struct amdgpu_vm *vm = bo_va->base.vm;
 
 	mapping->bo_va = bo_va;
+	if (amdgpu_vm_is_bo_always_valid(vm, bo_va->base.bo))
+		bo_va->base.bo->vm_priority_locked = true;
 	list_add(&mapping->list, &bo_va->invalids);
 	amdgpu_vm_it_insert(mapping, &vm->va);
 
@@ -3101,6 +3128,7 @@ int amdgpu_vm_init(struct amdgpu_device *adev, struct amdgpu_vm *vm,
 
 	amdgpu_vm_bo_status_init(&vm->kernel);
 	amdgpu_vm_bo_status_init(&vm->always_valid);
+	vm->sort_evicted = false;
 	spin_lock_init(&vm->individual_lock);
 	amdgpu_vm_bo_status_init(&vm->individual);
 	INIT_LIST_HEAD(&vm->freed);

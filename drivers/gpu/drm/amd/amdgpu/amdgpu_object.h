@@ -125,6 +125,9 @@ struct amdgpu_bo {
 	 * for memory accounting.
 	 */
 	int8_t				xcp_id;
+	/* VM reservation protected. Zero denotes the normal placement priority. */
+	s8				vm_priority_offset;
+	bool				vm_priority_locked;
 
 	/* UALink Handle low 64 bits*/
 	u64				ualink_handle_lo;

@@ -309,6 +309,7 @@ struct amdgpu_vm {
 	 * root PD
 	 */
 	struct amdgpu_vm_bo_status	always_valid;
+	bool				sort_evicted;
 
 	/*
 	 * The following lists contain amdgpu_vm_bo_base objects for BOs which

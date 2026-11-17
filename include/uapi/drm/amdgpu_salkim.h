@@ -40,10 +40,12 @@ struct drm_amdgpu_salkim_request {
 #define AMDGPU_SALKIM_OP_VA_BATCH 2
 #define AMDGPU_SALKIM_OP_UNMAP 3
 #define AMDGPU_SALKIM_OP_USERQ_CREATE 4
+#define AMDGPU_SALKIM_OP_BO_INITIAL_PRIORITY 6
 
 #define AMDGPU_SALKIM_CAP_BATCH_LEGACY (1ULL << 0)
 #define AMDGPU_SALKIM_CAP_BATCH_TIMELINE (1ULL << 1)
 #define AMDGPU_SALKIM_CAP_EXPLICIT_UNMAP (1ULL << 2)
+#define AMDGPU_SALKIM_CAP_BO_INITIAL_PRIORITY (1ULL << 4)
 
 /* Snapshot for this DRM file. Operations revalidate mutable VM eligibility. */
 struct drm_amdgpu_salkim_caps {
@@ -75,6 +77,21 @@ struct drm_amdgpu_salkim_userq_create {
 	union drm_amdgpu_userq args;
 	__s32 relative_priority;
 	__u32 reserved;
+};
+
+/*
+ * BO_INITIAL_PRIORITY sets an immutable placement hint for a VM_ALWAYS_VALID
+ * BO owned by this DRM file. Submit it before the first GPU VA mapping.
+ * Higher values get the first opportunity at preferred memory during VM
+ * revalidation. Ordinary GEM allocations use NORMAL. There is no residency
+ * guarantee. An identical hint is idempotent; a later change returns EBUSY.
+ */
+#define AMDGPU_SALKIM_BO_PRIORITY_NORMAL 14
+#define AMDGPU_SALKIM_BO_PRIORITY_MAX 31
+
+struct drm_amdgpu_salkim_bo_initial_priority {
+	__u32 handle;
+	__u32 priority;
 };
 
 #define AMDGPU_GEM_VA_BATCH_MAX_OPS	4096
