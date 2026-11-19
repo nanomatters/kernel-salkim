@@ -742,6 +742,9 @@ amdgpu_userq_wait_count_fences(struct drm_file *filp,
 	/* TODO: It is actually not necessary to lock them */
 	num_read_bo_handles = wait_info->num_bo_read_handles;
 	num_write_bo_handles = wait_info->num_bo_write_handles;
+	if (!num_read_bo_handles && !num_write_bo_handles)
+		goto set_count;
+
 	drm_exec_init(&exec, DRM_EXEC_INTERRUPTIBLE_WAIT | DRM_EXEC_IGNORE_DUPLICATES,
 		      num_read_bo_handles + num_write_bo_handles);
 
@@ -781,11 +784,12 @@ amdgpu_userq_wait_count_fences(struct drm_file *filp,
 				num_fences++;
 	}
 
+	drm_exec_fini(&exec);
+set_count:
 	wait_info->num_fences = min(num_fences, USHRT_MAX);
-	r = 0;
+	return 0;
 
 error_unlock:
-	/* Unlock all the GEM objects */
 	drm_exec_fini(&exec);
 	return r;
 }
@@ -894,6 +898,9 @@ amdgpu_userq_wait_return_fence_info(struct drm_device *dev, struct drm_file *fil
 	/* Lock all the GEM objects */
 	num_read_bo_handles = wait_info->num_bo_read_handles;
 	num_write_bo_handles = wait_info->num_bo_write_handles;
+	if (!num_read_bo_handles && !num_write_bo_handles)
+		goto wait_fences;
+
 	drm_exec_init(&exec, DRM_EXEC_INTERRUPTIBLE_WAIT | DRM_EXEC_IGNORE_DUPLICATES,
 		      num_read_bo_handles + num_write_bo_handles);
 
@@ -947,6 +954,7 @@ amdgpu_userq_wait_return_fence_info(struct drm_device *dev, struct drm_file *fil
 
 	drm_exec_fini(&exec);
 
+wait_fences:
 	/* Preserve explicit errors before deduplication drops older fences. */
 	for (i = 0; i < num_fences; i++) {
 		if (i < num_explicit_fences) {
