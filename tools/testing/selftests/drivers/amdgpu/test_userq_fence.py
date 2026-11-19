@@ -160,7 +160,7 @@ static int drm_syncobj_find_fence(struct drm_file *file, u32 handle, u64 point,
     return 0;
 }
 static void drm_exec_init(struct drm_exec *exec, unsigned flags, unsigned count)
-{ assert(!locked); locked = true; }
+{ assert(!locked && count); locked = true; }
 static int drm_exec_prepare_array(struct drm_exec *exec, struct drm_gem_object **objs,
                                   unsigned count, unsigned fences)
 { assert(locked && fences == 1); return 0; }
@@ -183,7 +183,13 @@ static unsigned dma_fence_dedup_array(struct dma_fence **fences, unsigned count)
     return n;
 }
 static struct amdgpu_usermode_queue *amdgpu_userq_get(struct amdgpu_userq_mgr *mgr, u32 id)
-{ assert(!locked && id == 7); queue.refs++; return &queue; }
+{
+    assert(!locked);
+    if (id != 7)
+        return NULL;
+    queue.refs++;
+    return &queue;
+}
 static void amdgpu_userq_put(struct amdgpu_usermode_queue *q) { assert(q->refs); q->refs--; }
 static void mutex_lock(int *m) { assert(!*m); *m = 1; }
 static void mutex_unlock(int *m) { assert(*m); *m = 0; }
@@ -240,6 +246,35 @@ static void check_wait(struct drm_file *file, struct dma_fence *f, unsigned tran
     }
     queue.fence_drv_xa.count = 0;
     f->signaled = was_signaled;
+    cases++;
+}
+
+static void check_empty_bo_lists(struct drm_file *file)
+{
+    struct dma_fence dependency = {.ops = &kernel_ops, .refs = 1};
+    struct drm_amdgpu_userq_fence_info out = {0};
+    struct drm_device dev = {0};
+    u32 handle = 0;
+
+    syncobjs[handle] = &dependency;
+    for (unsigned n = 0; n <= 1; n++) {
+        struct drm_amdgpu_userq_wait wait = {
+            .waitq_id = 7, .num_syncobj_handles = n, .out_fences = (uintptr_t)&out,
+        };
+
+        assert(!amdgpu_userq_wait_count_fences(file, &wait, &handle, NULL, NULL, NULL, NULL));
+        assert(wait.num_fences == n);
+        wait.num_fences = 1;
+        assert(!amdgpu_userq_wait_return_fence_info(&dev, file, &wait, &handle,
+                                                   NULL, NULL, NULL, NULL));
+        assert(!wait.num_fences && dependency.waited == n && dependency.refs == 1);
+        cases++;
+    }
+
+    struct drm_amdgpu_userq_wait invalid = {.num_fences = 1, .out_fences = (uintptr_t)&out};
+    assert(amdgpu_userq_wait_return_fence_info(&dev, file, &invalid, NULL,
+                                               NULL, NULL, NULL, NULL) == -EINVAL);
+    assert(!queue.refs && !locked);
     cases++;
 }
 
@@ -450,6 +485,7 @@ int main(void)
         queue.fence_drv_xa.count = 0;
         cases++;
     }
+    check_empty_bo_lists(&file);
     check_failed_dependencies(&file);
     check_mixed_dependencies(&file, other);
     /* An exported fence keeps its original identity after the DRM file is replaced. */
