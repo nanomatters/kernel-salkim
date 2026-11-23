@@ -880,7 +880,8 @@ int svm_migrate_vram_to_ram(struct svm_range *prange, struct mm_struct *mm,
 		addr = next;
 	}
 
-	if (r >= 0) {
+	/* Earlier VMAs may have migrated before a later one failed. */
+	if (mpages || r >= 0) {
 		WARN_ONCE(prange->vram_pages < mpages,
 			  "Recorded vram pages(0x%llx) should not be less than migration pages(0x%lx).",
 			  prange->vram_pages, mpages);
