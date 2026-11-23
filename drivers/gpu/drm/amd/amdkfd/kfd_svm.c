@@ -486,42 +486,26 @@ svm_range_validate_svm_bo(struct kfd_node *node, struct svm_range *prange)
 		return true;
 	}
 	if (svm_bo_ref_unless_zero(prange->svm_bo)) {
-		/*
-		 * Migrate from GPU to GPU, remove range from source svm_bo->node
-		 * range list, and return false to allocate svm_bo from destination
-		 * node.
-		 */
-		if (prange->svm_bo->node != node) {
-			mutex_unlock(&prange->lock);
+		struct svm_range_bo *svm_bo = prange->svm_bo;
 
-			spin_lock(&prange->svm_bo->list_lock);
+		if (svm_bo->node != node || READ_ONCE(svm_bo->evicting)) {
+			/* Detach here: eviction can only trylock our migrate_mutex. */
+			spin_lock(&svm_bo->list_lock);
 			list_del_init(&prange->svm_bo_list);
-			spin_unlock(&prange->svm_bo->list_lock);
-
-			svm_range_bo_unref(prange->svm_bo);
+			spin_unlock(&svm_bo->list_lock);
+			prange->svm_bo = NULL;
+			mutex_unlock(&prange->lock);
+			svm_range_bo_unref(svm_bo);
 			return false;
 		}
-		if (READ_ONCE(prange->svm_bo->evicting)) {
-			/* The BO is getting evicted,
-			 * we need to get a new one
-			 */
-			mutex_unlock(&prange->lock);
-			svm_range_bo_unref(prange->svm_bo);
-		} else {
-			/* The BO was still around and we got
-			 * a new reference to it
-			 */
-			mutex_unlock(&prange->lock);
-			pr_debug("reuse old bo svms 0x%p [0x%lx 0x%lx]\n",
-				 prange->svms, prange->start, prange->last);
-
-			prange->ttm_res = prange->svm_bo->bo.tbo.resource;
-			return true;
-		}
-
-	} else {
+		prange->ttm_res = svm_bo->bo.tbo.resource;
 		mutex_unlock(&prange->lock);
+		pr_debug("reuse old bo svms 0x%p [0x%lx 0x%lx]\n",
+			 prange->svms, prange->start, prange->last);
+
+		return true;
 	}
+	mutex_unlock(&prange->lock);
 
 	/* We need a new svm_bo. Spin-loop to wait for concurrent
 	 * svm_range_bo_release to finish removing this range from
