@@ -45,6 +45,7 @@
 #define dev_fmt(fmt) "kfd_svm: %s: " fmt, __func__
 
 #define AMDGPU_SVM_RANGE_RESTORE_DELAY_MS 1
+#define AMDGPU_SVM_RANGE_UNMAP_RETRY_DELAY msecs_to_jiffies(20)
 
 /* Long enough to ensure no retry fault comes after svm range is restored and
  * page table is updated.
@@ -316,7 +317,7 @@ static void svm_range_free(struct svm_range *prange, bool do_unmap)
 
 	mutex_destroy(&prange->lock);
 	mutex_destroy(&prange->migrate_mutex);
-	kfree(prange);
+	kvfree(prange);
 }
 
 static void
@@ -339,7 +340,7 @@ svm_range *svm_range_new(struct svm_range_list *svms, uint64_t start,
 	struct svm_range *prange;
 	struct kfd_process *p;
 
-	prange = kzalloc_obj(*prange);
+	prange = kvzalloc_flex(*prange, unmap_bitmap, BITS_TO_LONGS(size));
 	if (!prange)
 		return NULL;
 
@@ -348,7 +349,7 @@ svm_range *svm_range_new(struct svm_range_list *svms, uint64_t start,
 	    amdgpu_amdkfd_reserve_mem_limit(NULL, size << PAGE_SHIFT,
 				    KFD_IOC_ALLOC_MEM_FLAGS_USERPTR, 0)) {
 		pr_info("SVM mapping failed, exceeds resident system memory limit\n");
-		kfree(prange);
+		kvfree(prange);
 		return NULL;
 	}
 	prange->npages = size;
@@ -1907,7 +1908,7 @@ static int svm_range_validate_and_map(struct mm_struct *mm,
 		/* Free the hmm range */
 		amdgpu_hmm_range_free(range);
 
-		if (!r && !list_empty(&prange->child_list)) {
+		if (!r && (prange->unmap_pending || !list_empty(&prange->child_list))) {
 			pr_debug("range split by unmap in parallel, validate again\n");
 			r = -EAGAIN;
 		}
@@ -1943,25 +1944,32 @@ free_ctx:
 	return r;
 }
 
+static int svm_range_flush_deferred_work(struct svm_range_list *svms)
+{
+	flush_delayed_work(&svms->deferred_list_work);
+	return READ_ONCE(svms->deferred_unmap_failed) ? -ENOMEM : 0;
+}
+
 /**
  * svm_range_list_lock_and_flush_work - flush pending deferred work
  *
  * @svms: the svm range list
  * @mm: the mm structure
  *
- * Context: Returns with mmap write lock held, pending deferred work flushed
+ * Return: 0 with mmap write lock held, or -ENOMEM if a split is pending.
  *
  */
-void
+int
 svm_range_list_lock_and_flush_work(struct svm_range_list *svms,
 				   struct mm_struct *mm)
 {
 retry_flush_work:
-	flush_work(&svms->deferred_list_work);
+	if (svm_range_flush_deferred_work(svms))
+		return -ENOMEM;
 	mmap_write_lock(mm);
 
 	if (list_empty(&svms->deferred_range_list))
-		return;
+		return 0;
 	mmap_write_unlock(mm);
 	pr_debug("retry flush\n");
 	goto retry_flush_work;
@@ -1997,7 +2005,9 @@ static void svm_range_restore_work(struct work_struct *work)
 	}
 
 	mutex_lock(&process_info->lock);
-	svm_range_list_lock_and_flush_work(svms, mm);
+	r = svm_range_list_lock_and_flush_work(svms, mm);
+	if (r)
+		goto out_unlock_process;
 	mutex_lock(&svms->lock);
 
 	evicted_ranges = atomic_read(&svms->evicted_ranges);
@@ -2049,6 +2059,7 @@ static void svm_range_restore_work(struct work_struct *work)
 out_reschedule:
 	mutex_unlock(&svms->lock);
 	mmap_write_unlock(mm);
+out_unlock_process:
 	mutex_unlock(&process_info->lock);
 
 	/* If validation failed, reschedule another attempt, unless the
@@ -2510,25 +2521,34 @@ static void svm_range_drain_retry_fault(struct svm_range_list *svms)
 	}
 }
 
+static int svm_range_retry_unmap(struct svm_range *parent);
+
 static void svm_range_deferred_list_work(struct work_struct *work)
 {
 	struct svm_range_list *svms;
 	struct svm_range *prange;
 	struct mm_struct *mm;
 
-	svms = container_of(work, struct svm_range_list, deferred_list_work);
+	svms = container_of(to_delayed_work(work), struct svm_range_list, deferred_list_work);
 	pr_debug("enter svms 0x%p\n", svms);
 
 	spin_lock(&svms->deferred_list_lock);
 	while (!list_empty(&svms->deferred_range_list)) {
 		prange = list_first_entry(&svms->deferred_range_list,
 					  struct svm_range, deferred_list);
+		mm = prange->work_item.mm;
+		if (!mmget_not_zero(mm)) {
+			/* The notifiers and any split children go away at teardown. */
+			list_del_init(&prange->deferred_list);
+			spin_unlock(&svms->deferred_list_lock);
+			mmdrop(mm);
+			spin_lock(&svms->deferred_list_lock);
+			continue;
+		}
 		spin_unlock(&svms->deferred_list_lock);
 
 		pr_debug("prange 0x%p [0x%lx 0x%lx] op %d\n", prange,
 			 prange->start, prange->last, prange->work_item.op);
-
-		mm = prange->work_item.mm;
 
 		mmap_write_lock(mm);
 
@@ -2540,12 +2560,31 @@ static void svm_range_deferred_list_work(struct work_struct *work)
 		 *    lock and continue because deferred_list is empty, but
 		 *    deferred_list work is actually waiting for mmap lock.
 		 */
+		mutex_lock(&svms->lock);
+		mutex_lock(&prange->migrate_mutex);
+		if (prange->unmap_pending) {
+			int r;
+
+			svm_range_lock(prange);
+			r = svm_range_retry_unmap(prange);
+			svm_range_unlock(prange);
+			if (r) {
+				spin_lock(&svms->deferred_list_lock);
+				list_move_tail(&prange->deferred_list, &svms->deferred_range_list);
+				WRITE_ONCE(svms->deferred_unmap_failed, true);
+				schedule_delayed_work(&svms->deferred_list_work,
+						      AMDGPU_SVM_RANGE_UNMAP_RETRY_DELAY);
+				spin_unlock(&svms->deferred_list_lock);
+				mutex_unlock(&prange->migrate_mutex);
+				mutex_unlock(&svms->lock);
+				mmap_write_unlock(mm);
+				mmput_async(mm);
+				return;
+			}
+		}
 		spin_lock(&svms->deferred_list_lock);
 		list_del_init(&prange->deferred_list);
 		spin_unlock(&svms->deferred_list_lock);
-
-		mutex_lock(&svms->lock);
-		mutex_lock(&prange->migrate_mutex);
 		while (!list_empty(&prange->child_list)) {
 			struct svm_range *pchild;
 
@@ -2562,13 +2601,12 @@ static void svm_range_deferred_list_work(struct work_struct *work)
 		mutex_unlock(&svms->lock);
 		mmap_write_unlock(mm);
 
-		/* Pairs with mmget in svm_range_add_list_work. If dropping the
-		 * last mm refcount, schedule release work to avoid circular locking
-		 */
 		mmput_async(mm);
+		mmdrop(mm);
 
 		spin_lock(&svms->deferred_list_lock);
 	}
+	WRITE_ONCE(svms->deferred_unmap_failed, false);
 	spin_unlock(&svms->deferred_list_lock);
 	pr_debug("exit svms 0x%p\n", svms);
 }
@@ -2586,17 +2624,13 @@ svm_range_add_list_work(struct svm_range_list *svms, struct svm_range *prange,
 		    prange->work_item.op != SVM_OP_UNMAP_RANGE)
 			prange->work_item.op = op;
 	} else {
-		/* Pairs with mmput in deferred_list_work.
-		 * If process is exiting and mm is gone, don't update mmu notifier.
-		 */
-		if (mmget_not_zero(mm)) {
-			prange->work_item.mm = mm;
-			prange->work_item.op = op;
-			list_add_tail(&prange->deferred_list,
-				      &prange->svms->deferred_range_list);
-			pr_debug("add prange 0x%p [0x%lx 0x%lx] to work list op %d\n",
-				 prange, prange->start, prange->last, op);
-		}
+		/* A queued retry must not keep an exiting address space alive. */
+		mmgrab(mm);
+		prange->work_item.mm = mm;
+		prange->work_item.op = op;
+		list_add_tail(&prange->deferred_list, &svms->deferred_range_list);
+		pr_debug("add prange 0x%p [0x%lx 0x%lx] to work list op %d\n",
+			 prange, prange->start, prange->last, op);
 	}
 	spin_unlock(&svms->deferred_list_lock);
 }
@@ -2605,30 +2639,40 @@ void schedule_deferred_list_work(struct svm_range_list *svms)
 {
 	spin_lock(&svms->deferred_list_lock);
 	if (!list_empty(&svms->deferred_range_list))
-		schedule_work(&svms->deferred_list_work);
+		schedule_delayed_work(&svms->deferred_list_work, 0);
 	spin_unlock(&svms->deferred_list_lock);
 }
 
-static void
+static int
 svm_range_unmap_split(struct svm_range *parent, struct svm_range *prange, unsigned long start,
 		      unsigned long last)
 {
 	struct svm_range *head;
 	struct svm_range *tail;
+	int r;
 
 	if (prange->work_item.op == SVM_OP_UNMAP_RANGE) {
 		pr_debug("prange 0x%p [0x%lx 0x%lx] is already freed\n", prange,
 			 prange->start, prange->last);
-		return;
+		return 0;
 	}
 	if (start > prange->last || last < prange->start)
-		return;
+		return 0;
 
 	head = tail = prange;
-	if (start > prange->start)
-		svm_range_split(prange, prange->start, start - 1, &tail);
-	if (last < tail->last)
-		svm_range_split(tail, last + 1, tail->last, &head);
+	if (start > prange->start) {
+		r = svm_range_split(prange, prange->start, start - 1, &tail);
+		if (r)
+			return r;
+	}
+	if (last < tail->last) {
+		r = svm_range_split(tail, last + 1, tail->last, &head);
+		if (r) {
+			if (tail != prange)
+				svm_range_add_child(parent, tail, SVM_OP_ADD_RANGE);
+			return r;
+		}
+	}
 
 	if (head != prange && tail != prange) {
 		svm_range_add_child(parent, head, SVM_OP_UNMAP_RANGE);
@@ -2640,6 +2684,38 @@ svm_range_unmap_split(struct svm_range *parent, struct svm_range *prange, unsign
 	} else if (parent != prange) {
 		prange->work_item.op = SVM_OP_UNMAP_RANGE;
 	}
+	return 0;
+}
+
+/* Replay the metadata changes after the notifier has cleared the GPU PTEs. */
+static int svm_range_retry_unmap(struct svm_range *parent)
+{
+	unsigned long base = parent->notifier.interval_tree.start >> PAGE_SHIFT;
+	unsigned long pages = (parent->notifier.interval_tree.last >> PAGE_SHIFT) - base + 1;
+	unsigned long first, end;
+	struct svm_range *child;
+	int r;
+
+	for_each_set_bitrange(first, end, parent->unmap_bitmap, pages) {
+		unsigned long start = base + first, last = base + end - 1;
+		bool remove_parent = start <= parent->start && last >= parent->last;
+
+		list_for_each_entry(child, &parent->child_list, child_list) {
+			mutex_lock_nested(&child->lock, 1);
+			r = svm_range_unmap_split(parent, child, start, last);
+			mutex_unlock(&child->lock);
+			if (r)
+				return r;
+		}
+		r = svm_range_unmap_split(parent, parent, start, last);
+		if (r)
+			return r;
+		if (remove_parent)
+			parent->work_item.op = SVM_OP_UNMAP_RANGE;
+		bitmap_clear(parent->unmap_bitmap, first, end - first);
+	}
+	WRITE_ONCE(parent->unmap_pending, false);
+	return 0;
 }
 
 static void
@@ -2651,7 +2727,7 @@ svm_range_unmap_from_cpu(struct mm_struct *mm, struct svm_range *prange,
 	struct svm_range *pchild;
 	struct kfd_process *p;
 	unsigned long s, l;
-	bool unmap_parent;
+	bool unmap_parent, pending = prange->unmap_pending;
 
 	if (atomic_read(&prange->queue_refcount)) {
 		int r;
@@ -2681,14 +2757,20 @@ svm_range_unmap_from_cpu(struct mm_struct *mm, struct svm_range *prange,
 		l = min(last, pchild->last);
 		if (l >= s)
 			svm_range_unmap_from_gpus(pchild, s, l, pchild->bitmap_mapped, trigger);
-		svm_range_unmap_split(prange, pchild, start, last);
+		if (!pending && svm_range_unmap_split(prange, pchild, start, last))
+			pending = true;
 		mutex_unlock(&pchild->lock);
 	}
 	s = max(start, prange->start);
 	l = min(last, prange->last);
 	if (l >= s)
 		svm_range_unmap_from_gpus(prange, s, l, prange->bitmap_mapped, trigger);
-	svm_range_unmap_split(prange, prange, start, last);
+	if (pending || svm_range_unmap_split(prange, prange, start, last)) {
+		unsigned long base = prange->notifier.interval_tree.start >> PAGE_SHIFT;
+
+		bitmap_set(prange->unmap_bitmap, start - base, last - start + 1);
+		WRITE_ONCE(prange->unmap_pending, true);
+	}
 
 	if (unmap_parent)
 		svm_range_add_list_work(svms, prange, mm, SVM_OP_UNMAP_RANGE);
@@ -3046,6 +3128,10 @@ static bool svm_range_skip_recover(struct svm_range *prange)
 	struct svm_range_list *svms = prange->svms;
 
 	spin_lock(&svms->deferred_list_lock);
+	if (READ_ONCE(prange->unmap_pending)) {
+		spin_unlock(&svms->deferred_list_lock);
+		return true;
+	}
 	if (list_empty(&prange->deferred_list) &&
 	    list_empty(&prange->child_list)) {
 		spin_unlock(&svms->deferred_list_lock);
@@ -3407,8 +3493,7 @@ void svm_range_list_fini(struct kfd_process *p)
 
 	cancel_delayed_work_sync(&p->svms.restore_work);
 
-	/* Ensure list work is finished before process is destroyed */
-	flush_work(&p->svms.deferred_list_work);
+	disable_delayed_work_sync(&p->svms.deferred_list_work);
 
 	/*
 	 * Ensure no retry fault comes in afterwards, as page fault handler will
@@ -3419,8 +3504,23 @@ void svm_range_list_fini(struct kfd_process *p)
 	svm_range_drain_retry_fault(&p->svms);
 
 	list_for_each_entry_safe(prange, next, &p->svms.list, list) {
+		struct svm_range *child, *tmp;
+		struct mm_struct *mm = NULL;
+
 		svm_range_unlink(prange);
 		svm_range_remove_notifier(prange);
+		spin_lock(&p->svms.deferred_list_lock);
+		if (!list_empty(&prange->deferred_list)) {
+			list_del_init(&prange->deferred_list);
+			mm = prange->work_item.mm;
+		}
+		spin_unlock(&p->svms.deferred_list_lock);
+		if (mm)
+			mmdrop(mm);
+		list_for_each_entry_safe(child, tmp, &prange->child_list, child_list) {
+			list_del_init(&child->child_list);
+			svm_range_free(child, true);
+		}
 		svm_range_free(prange, true);
 	}
 
@@ -3443,7 +3543,7 @@ int svm_range_list_init(struct kfd_process *p)
 	atomic_set(&svms->evicted_ranges, 0);
 	atomic_set(&svms->drain_pagefaults, 0);
 	INIT_DELAYED_WORK(&svms->restore_work, svm_range_restore_work);
-	INIT_WORK(&svms->deferred_list_work, svm_range_deferred_list_work);
+	INIT_DELAYED_WORK(&svms->deferred_list_work, svm_range_deferred_list_work);
 	INIT_LIST_HEAD(&svms->deferred_range_list);
 	INIT_LIST_HEAD(&svms->criu_svm_metadata_list);
 	spin_lock_init(&svms->deferred_list_lock);
@@ -3859,7 +3959,9 @@ svm_range_set_attr(struct kfd_process *p, struct mm_struct *mm,
 
 	mutex_lock(&process_info->lock);
 
-	svm_range_list_lock_and_flush_work(svms, mm);
+	r = svm_range_list_lock_and_flush_work(svms, mm);
+	if (r)
+		goto out;
 
 	r = svm_range_is_valid(p, start, size);
 	if (r) {
@@ -4006,7 +4108,9 @@ svm_range_get_attr(struct kfd_process *p, struct mm_struct *mm,
 	 * would be a race condition in the application anyway, and undefined
 	 * behaviour is acceptable in that case.
 	 */
-	flush_work(&p->svms.deferred_list_work);
+	r = svm_range_flush_deferred_work(&p->svms);
+	if (r)
+		return r;
 
 	mmap_read_lock(mm);
 	r = svm_range_is_valid(p, start, size);

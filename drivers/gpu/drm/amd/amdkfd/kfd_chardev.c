@@ -1152,7 +1152,9 @@ static int kfd_ioctl_alloc_memory_of_gpu(struct file *filep,
 	/* Flush pending deferred work to avoid racing with deferred actions
 	 * from previous memory map changes (e.g. munmap).
 	 */
-	svm_range_list_lock_and_flush_work(&p->svms, current->mm);
+	err = svm_range_list_lock_and_flush_work(&p->svms, current->mm);
+	if (err)
+		return err;
 	mutex_lock(&p->svms.lock);
 	mmap_write_unlock(current->mm);
 

@@ -102,6 +102,8 @@ struct svm_work_list_item {
  * @bitmap_needs_unmap: index bitmap of GPUs which currently set NO_ACCESS
  * @bitmap_mapped: index bitmap of GPUs which currently have the range mapped
  * @mapping_done: true if range_validate_and_map complete successfully
+ * @unmap_pending: CPU unmaps waiting for a range split
+ * @unmap_bitmap: pending unmapped pages relative to the registered notifier
  *
  * Data structure for virtual memory range shared by CPU and GPUs, it can be
  * allocated from system memory ram or device vram, and migrate from ram to vram
@@ -140,7 +142,9 @@ struct svm_range {
 	DECLARE_BITMAP(bitmap_needs_unmap, MAX_GPU_INSTANCE);
 	DECLARE_BITMAP(bitmap_mapped, MAX_GPU_INSTANCE);
 	bool				mapping_done;
+	bool				unmap_pending;
 	atomic_t			queue_refcount;
+	unsigned long			unmap_bitmap[];
 };
 
 static inline void svm_range_lock(struct svm_range *prange)
@@ -201,7 +205,7 @@ int kfd_criu_restore_svm(struct kfd_process *p,
 int kfd_criu_resume_svm(struct kfd_process *p);
 struct kfd_process_device *
 svm_range_get_pdd_by_node(struct svm_range *prange, struct kfd_node *node);
-void svm_range_list_lock_and_flush_work(struct svm_range_list *svms, struct mm_struct *mm);
+int svm_range_list_lock_and_flush_work(struct svm_range_list *svms, struct mm_struct *mm);
 
 /* SVM API and HMM page migration work together, device memory type
  * is initialized to not 0 when page migration register device memory.

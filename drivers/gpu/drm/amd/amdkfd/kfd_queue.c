@@ -92,7 +92,7 @@ int kfd_queue_buffer_svm_get(struct kfd_process_device *pdd, u64 addr, u64 size)
 {
 	struct kfd_process *p = pdd->process;
 	struct list_head update_list;
-	struct svm_range *prange;
+	struct svm_range *prange, *parent;
 	int ret = -EINVAL;
 
 	INIT_LIST_HEAD(&update_list);
@@ -108,9 +108,13 @@ int kfd_queue_buffer_svm_get(struct kfd_process_device *pdd, u64 addr, u64 size)
 		uint32_t gpuid, gpuidx;
 		int r;
 
-		prange = svm_range_from_addr(&p->svms, addr, NULL);
+		prange = svm_range_from_addr(&p->svms, addr, &parent);
 		if (!prange)
 			break;
+		if (READ_ONCE(parent->unmap_pending)) {
+			ret = -EAGAIN;
+			goto out_unlock;
+		}
 
 		r = kfd_process_gpuid_from_node(p, pdd->dev, &gpuid, &gpuidx);
 		if (r < 0)

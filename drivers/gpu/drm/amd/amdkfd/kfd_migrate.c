@@ -972,7 +972,7 @@ static vm_fault_t svm_migrate_to_ram(struct vm_fault *vmf)
 	unsigned long start, last, size;
 	unsigned long addr = vmf->address;
 	struct svm_range_bo *svm_bo;
-	struct svm_range *prange;
+	struct svm_range *prange, *parent;
 	struct kfd_process *p;
 	struct mm_struct *mm;
 	int r = 0;
@@ -1008,7 +1008,7 @@ static vm_fault_t svm_migrate_to_ram(struct vm_fault *vmf)
 
 	mutex_lock(&p->svms.lock);
 
-	prange = svm_range_from_addr(&p->svms, addr, NULL);
+	prange = svm_range_from_addr(&p->svms, addr, &parent);
 	if (!prange) {
 		pr_debug("failed get range svms 0x%p addr 0x%lx\n", &p->svms, addr);
 		r = -EFAULT;
@@ -1020,8 +1020,8 @@ static vm_fault_t svm_migrate_to_ram(struct vm_fault *vmf)
 	if (!prange->actual_loc)
 		goto out_unlock_prange;
 
-	/* Align migration range start and size to granularity size */
-	size = 1UL << prange->granularity;
+	/* A pending unmap can leave a hole inside the migration granule. */
+	size = READ_ONCE(parent->unmap_pending) ? 1 : 1UL << prange->granularity;
 	start = max(ALIGN_DOWN(addr, size), prange->start);
 	last = min(ALIGN(addr + 1, size) - 1, prange->last);
 
