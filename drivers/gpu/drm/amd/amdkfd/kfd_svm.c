@@ -3793,10 +3793,8 @@ int svm_range_evict_svm_bo(struct amdgpu_bo *bo)
 	if (!svm_bo_ref_unless_zero(svm_bo))
 		return 0;
 
-	if (!mmget_not_zero(svm_bo->mm)) {
-		svm_range_bo_unref(svm_bo);
-		return 0;
-	}
+	if (!mmget_not_zero(svm_bo->mm))
+		goto check_refs;
 	mm = svm_bo->mm;
 
 	/*
@@ -3823,18 +3821,14 @@ int svm_range_evict_svm_bo(struct amdgpu_bo *bo)
 		int retries = 3;
 
 		/*
-		 * Trylock migrate_mutex under list_lock, before unlinking the
-		 * range, so svm_range_free() cannot free it under us. On
-		 * contention the owner is migrating this range; skip the BO.
+		 * Trylock migrate_mutex under list_lock so svm_range_free()
+		 * cannot free the range under us. Skip busy ranges.
 		 */
 		if (!mutex_trylock(&prange->migrate_mutex)) {
 			pr_debug("skip eviction, contended migrate_mutex\n");
-			/* Clear evicting so the BO keeps being reused. */
-			WRITE_ONCE(svm_bo->evicting, 0);
 			r = -EBUSY;
 			break;
 		}
-		list_del_init(&prange->svm_bo_list);
 		spin_unlock(&svm_bo->list_lock);
 
 		pr_debug("svms 0x%p [0x%lx 0x%lx]\n", prange->svms,
@@ -3849,11 +3843,14 @@ int svm_range_evict_svm_bo(struct amdgpu_bo *bo)
 					KFD_MIGRATE_TRIGGER_TTM_EVICTION, NULL);
 		} while (!r && prange->actual_loc && --retries);
 
-		if (!r && prange->actual_loc)
-			pr_info_once("Migration failed during eviction");
-
-		if (!prange->actual_loc) {
+		if (prange->actual_loc) {
+			if (!r)
+				r = -EBUSY;
+		} else {
 			mutex_lock(&prange->lock);
+			spin_lock(&svm_bo->list_lock);
+			list_del_init(&prange->svm_bo_list);
+			spin_unlock(&svm_bo->list_lock);
 			prange->svm_bo = NULL;
 			mutex_unlock(&prange->lock);
 		}
@@ -3866,10 +3863,12 @@ int svm_range_evict_svm_bo(struct amdgpu_bo *bo)
 	/* Defer mmput: exit_mmap() must not run under the BO reservation. */
 	mmput_async(mm);
 
-	/* This is the last reference to svm_bo, after svm_range_vram_node_free
-	 * has been called in svm_migrate_vram_to_ram
-	 */
-	WARN_ONCE(!r && kref_read(&svm_bo->kref) != 1, "This was not the last reference\n");
+check_refs:
+	/* Forked mappings can keep device pages alive after the owning mm exits. */
+	if (!r && kref_read(&svm_bo->kref) != 1)
+		r = -EBUSY;
+	if (r)
+		WRITE_ONCE(svm_bo->evicting, 0);
 	svm_range_bo_unref(svm_bo);
 
 	return r;
