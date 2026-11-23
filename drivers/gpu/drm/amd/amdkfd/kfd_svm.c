@@ -2158,7 +2158,7 @@ svm_range_evict(struct svm_range *prange, struct mm_struct *mm,
 			s = max(start, pchild->start);
 			l = min(last, pchild->last);
 			if (l >= s)
-				svm_range_unmap_from_gpus(pchild, s, l, prange->bitmap_mapped,
+				svm_range_unmap_from_gpus(pchild, s, l, pchild->bitmap_mapped,
 							  trigger);
 			mutex_unlock(&pchild->lock);
 		}
@@ -2679,7 +2679,7 @@ svm_range_unmap_from_cpu(struct mm_struct *mm, struct svm_range *prange,
 		s = max(start, pchild->start);
 		l = min(last, pchild->last);
 		if (l >= s)
-			svm_range_unmap_from_gpus(pchild, s, l, prange->bitmap_mapped, trigger);
+			svm_range_unmap_from_gpus(pchild, s, l, pchild->bitmap_mapped, trigger);
 		svm_range_unmap_split(prange, pchild, start, last);
 		mutex_unlock(&pchild->lock);
 	}
