@@ -1141,6 +1141,7 @@ svm_range_split_adjust(struct svm_range *new, struct svm_range *old,
 	bitmap_copy(new->bitmap_access, old->bitmap_access, MAX_GPU_INSTANCE);
 	bitmap_copy(new->bitmap_aip, old->bitmap_aip, MAX_GPU_INSTANCE);
 	bitmap_copy(new->bitmap_mapped, old->bitmap_mapped, MAX_GPU_INSTANCE);
+	atomic_set(&new->invalid, atomic_read(&old->invalid));
 	atomic_set(&new->queue_refcount, atomic_read(&old->queue_refcount));
 
 	return 0;
@@ -3809,6 +3810,24 @@ static bool svm_range_needs_unmap(struct kfd_process *p, struct svm_range *prang
 	return bitmap_empty(prange->bitmap_mapped, MAX_GPU_INSTANCE);
 }
 
+/* The old notifier can receive invalidations until its removal completes. */
+static void svm_range_transfer_eviction(struct svm_range *old)
+{
+	struct interval_tree_node *node;
+	int invalid = atomic_read(&old->invalid);
+
+	if (!invalid)
+		return;
+
+	node = interval_tree_iter_first(&old->svms->objects, old->start, old->last);
+	while (node) {
+		struct svm_range *new = container_of(node, struct svm_range, it_node);
+
+		atomic_cmpxchg(&new->invalid, 0, invalid);
+		node = interval_tree_iter_next(node, old->start, old->last);
+	}
+}
+
 static int
 svm_range_set_attr(struct kfd_process *p, struct mm_struct *mm,
 		   uint64_t start, uint64_t size, uint32_t nattr,
@@ -3876,6 +3895,7 @@ svm_range_set_attr(struct kfd_process *p, struct mm_struct *mm,
 			 prange->last);
 		svm_range_unlink(prange);
 		svm_range_remove_notifier(prange);
+		svm_range_transfer_eviction(prange);
 		svm_range_free(prange, false);
 	}
 
