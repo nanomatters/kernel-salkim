@@ -1119,7 +1119,7 @@ void hdmi_frl_set_preferred_link_settings(struct dc *dc,
 		link_stat = hdmi_frl_perform_link_training_with_retries(link_stream->link);
 
 		/* Enable FRL packet transmission */
-		if (link_stat == LINK_RESULT_SUCCESS || link_stat == LINK_RESULT_NO_TIMEOUT) {
+		if (link_stat == LINK_RESULT_SUCCESS) {
 			link_stream->link->hpo_frl_link_enc->funcs->enable_output(
 					link_stream->link->hpo_frl_link_enc);
 			if (link_stream->link->frl_flags.apply_vsdb_rcc_wa)
